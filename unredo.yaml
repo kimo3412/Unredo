@@ -1,0 +1,24 @@
+version: 1
+
+profiles:
+  local:
+    backend: mysql
+    source:
+      mode: replication
+      address: 127.0.0.1:3306
+      user: unredo_reader
+      password_env: UNREDO_READER_PASSWORD
+      server_id: 100001
+    target:
+      address: 127.0.0.1:3306
+      user: unredo_executor
+      password_env: UNREDO_EXECUTOR_PASSWORD
+    policy:
+      require_gtid: true
+      require_full_row_image: true
+      require_primary_key: true
+      max_transaction_rows: 1000
+      max_transaction_bytes: 67108864
+      max_plan_bytes: 134217728
+      max_action_depth: 20
+      lock_wait_timeout: 5s
