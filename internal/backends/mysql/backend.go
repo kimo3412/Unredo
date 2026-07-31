@@ -30,12 +30,14 @@ func init() {
 // Backend is the MySQL adapter. It implements ports.Backend by composing
 // the source, schema, and (later) executor sub-packages.
 type Backend struct {
-	instanceID string
-	sourceDSN  string
-	targetDSN  string
-	policy     config.Policy
-	inspector  ports.SchemaInspector
-	source     *mysqlsource.Source
+	instanceID       string
+	targetInstanceID string
+	sourceDSN        string
+	targetDSN        string
+	serverID         uint32
+	policy           config.Policy
+	inspector        ports.SchemaInspector
+	source           *mysqlsource.Source
 }
 
 // NewBackend builds a Backend from a profile. The source connection is
@@ -62,14 +64,21 @@ func NewBackend(p *config.Profile) (ports.Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mysql: detect server uuid: %w", err)
 	}
+	targetInstanceID, err := fetchServerUUID(tgtDSN)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: detect target server uuid: %w", err)
+	}
 	insp := schema.NewInspector(srcDSN)
 	return &Backend{
-		instanceID: instanceID,
-		sourceDSN:  srcDSN,
-		targetDSN:  tgtDSN,
-		policy:     p.Policy,
-		inspector:  insp,
-		source:     mysqlsource.New(srcDSN, instanceID, p.Source.ServerID),
+		instanceID:       instanceID,
+		targetInstanceID: targetInstanceID,
+		sourceDSN:        srcDSN,
+		targetDSN:        tgtDSN,
+		serverID:         p.Source.ServerID,
+		policy:           p.Policy,
+		inspector:        insp,
+		source: mysqlsource.New(srcDSN, instanceID, p.Source.ServerID,
+			p.Policy.MaxTransactionRows, p.Policy.MaxTransactionBytes),
 	}, nil
 }
 
@@ -83,16 +92,8 @@ func (b *Backend) InstanceID() string { return b.instanceID }
 // MySQL 8 with ROW/FULL/GTID is the assumed M0 configuration. The flags
 // reflect what the planner can rely on; schema-at-event-time is reported
 // as true only when we read schema with the source conn, which we do.
-func (b *Backend) Capabilities(_ context.Context) (core.BackendCapabilities, error) {
-	return core.BackendCapabilities{
-		FullBeforeImage:       true,
-		FullAfterImage:        true,
-		StableTransactionID:   true, // GTID
-		TransactionBoundaries: true, // XID + GTID
-		AtomicActionMarker:    true, // unredo_meta.action_markers (M2; reported optimistically in M0)
-		SchemaAtEventTime:     true, // we read information_schema alongside the stream
-		SupportsReapply:       true,
-	}, nil
+func (b *Backend) Capabilities(ctx context.Context) (core.BackendCapabilities, error) {
+	return b.source.Capabilities(ctx)
 }
 
 // InspectTable delegates to the schema inspector.
@@ -118,11 +119,19 @@ func (b *Backend) Find(ctx context.Context, ref core.TransactionRef) (*core.Tran
 // Check verifies that the current state of the target database still
 // matches the plan's expect images. The executor itself lives in
 // internal/executor; this method adapts the result into ports.Conflict.
-func (b *Backend) Check(ctx context.Context, plan ports.Plan) ([]ports.Conflict, error) {
-	reader := NewCheckReader(b.targetDSN, b.instanceID)
+func (b *Backend) Check(ctx context.Context, plan ports.Plan) (*ports.CheckResult, error) {
+	reader := NewCheckReader(b.targetDSN, b.targetInstanceID)
 	result, err := executor.Check(ctx, &plan, reader)
 	if err != nil {
 		return nil, err
+	}
+	out := &ports.CheckResult{
+		Status: string(result.Status), PlanDigest: result.PlanDigest,
+		TargetInstance: result.TargetInstance, OperationsTotal: result.OperationsTotal,
+		SchemaChecks: make([]ports.SchemaCheck, 0, len(result.SchemaChecks)),
+	}
+	for _, s := range result.SchemaChecks {
+		out.SchemaChecks = append(out.SchemaChecks, ports.SchemaCheck{Table: s.Table, PlanDigest: s.PlanDigest, ActualDigest: s.ActualDigest, Match: s.Match})
 	}
 	conflicts := make([]ports.Conflict, 0, len(result.Conflicts))
 	for _, c := range result.Conflicts {
@@ -130,16 +139,42 @@ func (b *Backend) Check(ctx context.Context, plan ports.Plan) ([]ports.Conflict,
 			OperationSequence: c.OperationSequence,
 			Table:             c.Table,
 			Kind:              string(c.Kind),
+			Column:            c.Column,
+			Expected:          c.Expected,
+			Actual:            c.Actual,
 			Message:           c.Message,
 		})
 	}
-	return conflicts, nil
+	out.Conflicts = conflicts
+	return out, nil
 }
 
 // Apply executes a plan in a single InnoDB transaction together with
 // the action marker. See ports.ApplyRequest for what the caller
 // supplies; everything else comes from the plan.
 func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyRequest) (ports.ExecutionResult, error) {
+	if plan.Ref.Backend != "mysql" {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql: plan backend is %q: %w", plan.Ref.Backend, ports.ErrUnsupportedCapability)
+	}
+	if plan.ExecutionClass != "safe" {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql: execution class %q is not implemented: %w", plan.ExecutionClass, ports.ErrUnsupportedCapability)
+	}
+	// Apply must never rely on a check performed by an earlier CLI command.
+	// Re-check the real target instance, schema and current row images now.
+	reader := NewCheckReader(b.targetDSN, b.targetInstanceID)
+	check, err := executor.Check(ctx, &plan, reader)
+	if err != nil {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql: pre-apply check: %w", err)
+	}
+	switch check.Status {
+	case executor.StatusReady:
+	case executor.StatusSourceMismatch:
+		return ports.ExecutionResult{}, ports.ErrInstanceMismatch
+	case executor.StatusStaleSchema:
+		return ports.ExecutionResult{}, ports.ErrSchemaMismatch
+	default:
+		return ports.ExecutionResult{}, executor.ErrApplyConflict
+	}
 	writer := NewApplyWriterFromBackend(b)
 	opts, err := b.buildApplyOptions(plan, req)
 	if err != nil {
@@ -177,23 +212,23 @@ func (b *Backend) buildApplyOptions(plan ports.Plan, req ports.ApplyRequest) (ex
 	}
 	chainDepth := uint32(0) // M2 has no chain concept; M3 will compute it
 	return executor.ApplyOptions{
-		PlanID:                     planID,
-		ActionID:                   actionIDBytes,
-		ActionType:                 actionType,
-		TargetState:                targetState,
-		ChainDepth:                 chainDepth,
-		ParentActionID:             nil,
-		OperatorName:               req.OperatorName,
-		Reason:                     req.Reason,
-		ExecutionClass:             executionClass,
-		SourceNativeTransactionID:  plan.Ref.NativeTransactionID,
-		Confirm:                    req.Confirm,
+		PlanID:                    planID,
+		ActionID:                  actionIDBytes,
+		ActionType:                actionType,
+		TargetState:               targetState,
+		ChainDepth:                chainDepth,
+		ParentActionID:            nil,
+		OperatorName:              req.OperatorName,
+		Reason:                    req.Reason,
+		ExecutionClass:            executionClass,
+		SourceNativeTransactionID: plan.Ref.NativeTransactionID,
+		Confirm:                   req.Confirm,
 	}, nil
 }
 
 // RunDoctor exposes the doctor checks for the CLI.
 func (b *Backend) RunDoctor(_ context.Context, d *doctor.Deps) (*doctor.Report, error) {
-	return doctor.Run(d, b.sourceDSN, b.targetDSN, b.instanceID, b.policy)
+	return doctor.Run(d, b.sourceDSN, b.targetDSN, b.instanceID, b.serverID, b.policy)
 }
 
 func buildDSN(addr, user, passwordEnv string, serverID uint32) (string, error) {

@@ -16,6 +16,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 log_bin=ON
 binlog_format=ROW
 binlog_row_image=FULL
+binlog_row_metadata=FULL
 gtid_mode=ON
 enforce_gtid_consistency=ON
 ```

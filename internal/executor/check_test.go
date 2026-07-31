@@ -9,13 +9,21 @@ import (
 	"github.com/girimi/unredo/internal/ports"
 )
 
+func TestValuesEqualDoesNotLoseBigIntPrecision(t *testing.T) {
+	a := core.Value{Kind: core.KindInteger, Data: core.RawJSON(`9007199254740992`)}
+	b := core.Value{Kind: core.KindInteger, Data: core.RawJSON(`9007199254740993`)}
+	if valuesEqual(a, b) {
+		t.Fatal("adjacent BIGINT values above float64 precision compared equal")
+	}
+}
+
 type fakeReader struct {
-	instance  string
-	fp        core.SchemaFingerprint
-	fpErr     error
-	row       Row
-	rowFound  bool
-	rowErr    error
+	instance string
+	fp       core.SchemaFingerprint
+	fpErr    error
+	row      Row
+	rowFound bool
+	rowErr   error
 }
 
 func (f *fakeReader) ReadByKey(_ context.Context, _ core.TableRef, _ []string, _ core.Row) (Row, bool, error) {
@@ -30,8 +38,12 @@ func (f *fakeReader) Fingerprint(_ context.Context, _ core.TableRef) (core.Schem
 func (f *fakeReader) TargetInstanceID() string { return f.instance }
 
 func intVal(s string) core.Value { return core.Value{Kind: core.KindInteger, Data: core.RawJSON(s)} }
-func strVal(s string) core.Value { return core.Value{Kind: core.KindText, Data: core.RawJSON("\"" + s + "\"")} }
-func decVal(s string) core.Value { return core.Value{Kind: core.KindDecimal, Encoding: "string", Data: core.RawJSON("\"" + s + "\"")} }
+func strVal(s string) core.Value {
+	return core.Value{Kind: core.KindText, Data: core.RawJSON("\"" + s + "\"")}
+}
+func decVal(s string) core.Value {
+	return core.Value{Kind: core.KindDecimal, Encoding: "string", Data: core.RawJSON("\"" + s + "\"")}
+}
 
 func TestCheckReadyOnRevertInsert(t *testing.T) {
 	plan := &ports.Plan{

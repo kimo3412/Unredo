@@ -51,6 +51,7 @@ MVP 是一个本地运行、无常驻服务的 CLI：
 - InnoDB。
 - `binlog_format=ROW`。
 - 推荐并默认要求 `binlog_row_image=FULL`。
+- 要求 `binlog_row_metadata=FULL`，用于核对历史事件列名并拒绝无法证明 schema 的旧事件。
 - 有主键或非空唯一键的表。
 - 已提交的单实例事务。
 - `INSERT`、`UPDATE`、`DELETE` 行事件。
@@ -210,6 +211,7 @@ unredo doctor
 - MySQL 版本。
 - binlog 是否启用。
 - binlog format 和 row image。
+- binlog row metadata 是否为 FULL。
 - GTID 状态。
 - binlog 保留范围。
 - Unredo replication `server_id` 是否为合法非零值。
@@ -510,7 +512,7 @@ MVP 只支持 marker 表和目标表位于同一 MySQL 实例的执行模式。
 5. 使用带前置条件的 SQL 执行补偿。
 6. 检查每条语句 affected rows 是否符合预期。
 7. 全部成功后 commit；任意失败则 rollback。
-8. 从 session GTID tracking 获取补偿事务 GTID并展示；若获取失败，action 仍可由 marker 恢复关联。
+8. 返回 action ID；补偿事务 GTID 必须通过 marker 与 binlog 精确关联，不能从全局 GTID 尾部猜测。关联功能未实现时该字段留空。
 
 执行时不能使用简单的“先 SELECT、后无条件 UPDATE”。校验与写入之间必须处于同一事务，并通过锁或条件 SQL 防止 TOCTOU 竞争。
 

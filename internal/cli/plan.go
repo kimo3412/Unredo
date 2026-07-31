@@ -11,9 +11,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
-	"github.com/girimi/unredo/internal/backends/mysql"
 	"github.com/girimi/unredo/internal/core"
-	"github.com/girimi/unredo/internal/executor"
 	"github.com/girimi/unredo/internal/planner"
 	"github.com/girimi/unredo/internal/ports"
 )
@@ -72,11 +70,10 @@ func runPlanCheck(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	src, ok := be.(ports.ChangeSource)
+	planExecutor, ok := be.(ports.PlanExecutor)
 	if !ok {
-		return fmt.Errorf("backend %q does not implement ChangeSource", be.Name())
+		return fmt.Errorf("backend %q does not implement PlanExecutor", be.Name())
 	}
-	_ = src // source unused by check, but used to confirm backend is alive
 
 	timeoutStr, _ := cmd.Flags().GetString("timeout")
 	dur, _ := time.ParseDuration(timeoutStr)
@@ -86,11 +83,7 @@ func runPlanCheck(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), dur)
 	defer cancel()
 
-	reader := mysqlBackendCheckReader(be)
-	if reader == nil {
-		return fmt.Errorf("backend %q does not support plan check", be.Name())
-	}
-	result, err := executor.Check(ctx, plan.ToPorts(), reader)
+	result, err := planExecutor.Check(ctx, *plan.ToPorts())
 	if err != nil {
 		return fmt.Errorf("check: %w", err)
 	}
@@ -105,13 +98,13 @@ func runPlanCheck(cmd *cobra.Command, args []string) error {
 	printCheckHuman(cmd, result, showConflicts)
 
 	switch result.Status {
-	case executor.StatusReady:
+	case "READY":
 		return nil
-	case executor.StatusStaleSchema:
+	case "STALE_SCHEMA":
 		return fmt.Errorf("plan is stale: schema drifted")
-	case executor.StatusSourceMismatch:
+	case "SOURCE_MISMATCH":
 		return fmt.Errorf("plan was generated for a different instance")
-	case executor.StatusConflict:
+	case "CONFLICT":
 		return fmt.Errorf("plan has %d conflict(s); rerun with --show-conflicts", len(result.Conflicts))
 	default:
 		return fmt.Errorf("plan check returned %s", result.Status)
@@ -183,8 +176,13 @@ func runPlanApply(cmd *cobra.Command, args []string) error {
 		if got != planner.ShortDigest(plan.Digest) {
 			return fmt.Errorf("confirmation %q does not match; aborting", got)
 		}
-	} else if confirm != "" && confirm != planner.ShortDigest(plan.Digest) {
-		return fmt.Errorf("--confirm-sha %q does not match plan digest sha256:%s", confirm, planner.ShortDigest(plan.Digest))
+	} else {
+		if confirm == "" {
+			return fmt.Errorf("--confirm-sha is required with --non-interactive")
+		}
+		if confirm != planner.ShortDigest(plan.Digest) {
+			return fmt.Errorf("--confirm-sha %q does not match plan digest sha256:%s", confirm, planner.ShortDigest(plan.Digest))
+		}
 	}
 
 	timeoutStr, _ := cmd.Flags().GetString("timeout")
@@ -237,7 +235,7 @@ func notImplemented(name string) func(cmd *cobra.Command, args []string) error {
 // touch the target database; that is what `plan check` and `plan apply`
 // do in M2.
 func runPlanCreate(cmd *cobra.Command, _ []string) error {
-	be, _, err := resolveBackend(cmd)
+	be, profile, err := resolveBackend(cmd)
 	if err != nil {
 		return err
 	}
@@ -318,7 +316,7 @@ func runPlanCreate(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("build plan: %w", err)
 	}
-	if err := planner.WriteFile(plan, output); err != nil {
+	if err := planner.WriteFileLimited(plan, output, profile.Policy.MaxPlanBytes); err != nil {
 		return fmt.Errorf("write plan: %w", err)
 	}
 
@@ -355,18 +353,7 @@ func toolVersion() string {
 	return "0.1.0-m1"
 }
 
-// mysqlBackendCheckReader pulls the MySQL backend's check reader out
-// of the resolved backend. Other backends would provide their own
-// type assertion here; for now MySQL is the only one.
-func mysqlBackendCheckReader(be ports.Backend) executor.Reader {
-	mbe, ok := be.(*mysql.Backend)
-	if !ok {
-		return nil
-	}
-	return mysql.NewCheckReaderFromBackend(mbe)
-}
-
-func printCheckHuman(cmd *cobra.Command, r *executor.CheckResult, showConflicts bool) {
+func printCheckHuman(cmd *cobra.Command, r *ports.CheckResult, showConflicts bool) {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "status:        %s\n", r.Status)
 	fmt.Fprintf(out, "plan_digest:   %s\n", r.PlanDigest)

@@ -14,12 +14,12 @@ import (
 // Stable domain errors. Backends translate native errors into one of these
 // so the CLI can map them to the documented exit codes.
 var (
-	ErrTransactionNotFound    = errors.New("transaction not found")
-	ErrUnsupportedCapability  = errors.New("unsupported capability")
-	ErrCommitUnknown          = errors.New("commit result unknown")
-	ErrSchemaMismatch         = errors.New("schema mismatch")
-	ErrPlanDigestMismatch     = errors.New("plan digest mismatch")
-	ErrInstanceMismatch       = errors.New("instance id mismatch")
+	ErrTransactionNotFound   = errors.New("transaction not found")
+	ErrUnsupportedCapability = errors.New("unsupported capability")
+	ErrCommitUnknown         = errors.New("commit result unknown")
+	ErrSchemaMismatch        = errors.New("schema mismatch")
+	ErrPlanDigestMismatch    = errors.New("plan digest mismatch")
+	ErrInstanceMismatch      = errors.New("instance id mismatch")
 )
 
 // ScanScope narrows what a Scan call returns. Backend-specific fields
@@ -68,20 +68,39 @@ type SchemaInspector interface {
 
 // Conflict describes one precondition failure during plan check.
 type Conflict struct {
-	OperationSequence int      `json:"operation_sequence"`
+	OperationSequence int           `json:"operation_sequence"`
 	Table             core.TableRef `json:"table"`
-	Kind              string   `json:"kind"`
-	ExpectedDigest    string   `json:"expected_digest,omitempty"`
-	ActualDigest      string   `json:"actual_digest,omitempty"`
-	Message           string   `json:"message"`
+	Kind              string        `json:"kind"`
+	Column            string        `json:"column,omitempty"`
+	Expected          core.Value    `json:"expected,omitempty"`
+	Actual            core.Value    `json:"actual,omitempty"`
+	ExpectedDigest    string        `json:"expected_digest,omitempty"`
+	ActualDigest      string        `json:"actual_digest,omitempty"`
+	Message           string        `json:"message"`
+}
+
+type SchemaCheck struct {
+	Table        core.TableRef `json:"table"`
+	PlanDigest   string        `json:"plan_digest"`
+	ActualDigest string        `json:"actual_digest"`
+	Match        bool          `json:"match"`
+}
+
+type CheckResult struct {
+	Status          string        `json:"status"`
+	PlanDigest      string        `json:"plan_digest"`
+	TargetInstance  string        `json:"target_instance"`
+	SchemaChecks    []SchemaCheck `json:"schema_checks"`
+	Conflicts       []Conflict    `json:"conflicts"`
+	OperationsTotal int           `json:"operations_total"`
 }
 
 // Plan is a backend-neutral view of an executable plan. The on-disk
 // representation may add backend extensions; this is the core subset.
 type Plan struct {
 	PlanID             string              `json:"plan_id,omitempty"`
-	Mode               string              `json:"mode,omitempty"`               // "revert" or "reapply"
-	ExecutionClass     string              `json:"execution_class,omitempty"`     // "safe" or "unsafe_resolved"
+	Mode               string              `json:"mode,omitempty"`            // "revert" or "reapply"
+	ExecutionClass     string              `json:"execution_class,omitempty"` // "safe" or "unsafe_resolved"
 	Ref                core.TransactionRef `json:"source"`
 	Operations         []PlanOperation     `json:"operations"`
 	SchemaFingerprints map[string]string   `json:"schema_fingerprints,omitempty"`
@@ -90,12 +109,12 @@ type Plan struct {
 
 // PlanOperation is one row-level step the executor will perform.
 type PlanOperation struct {
-	Sequence int             `json:"sequence"`
-	Table    core.TableRef   `json:"table"`
+	Sequence int                `json:"sequence"`
+	Table    core.TableRef      `json:"table"`
 	Kind     core.OperationKind `json:"kind"`
-	Key      core.Row        `json:"key"`
-	Expect   core.Row        `json:"expect"`
-	Write    core.Row        `json:"write"`
+	Key      core.Row           `json:"key"`
+	Expect   core.Row           `json:"expect"`
+	Write    core.Row           `json:"write"`
 }
 
 // ExecutionResult is the outcome of Apply.
@@ -118,7 +137,7 @@ type ApplyRequest struct {
 // PlanExecutor checks and applies plans against the target database.
 // Check is read-only; Apply writes.
 type PlanExecutor interface {
-	Check(ctx context.Context, plan Plan) ([]Conflict, error)
+	Check(ctx context.Context, plan Plan) (*CheckResult, error)
 	Apply(ctx context.Context, plan Plan, req ApplyRequest) (ExecutionResult, error)
 }
 

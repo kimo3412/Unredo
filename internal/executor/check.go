@@ -9,7 +9,6 @@ package executor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/girimi/unredo/internal/core"
@@ -29,21 +28,21 @@ const (
 
 // SchemaCheck is the per-table fingerprint comparison result.
 type SchemaCheck struct {
-	Table         core.TableRef `json:"table"`
-	PlanDigest    string        `json:"plan_digest"`
-	ActualDigest  string        `json:"actual_digest"`
-	Match         bool          `json:"match"`
+	Table        core.TableRef `json:"table"`
+	PlanDigest   string        `json:"plan_digest"`
+	ActualDigest string        `json:"actual_digest"`
+	Match        bool          `json:"match"`
 }
 
 // ConflictKind classifies what went wrong.
 type ConflictKind string
 
 const (
-	ConflictRowMissing     ConflictKind = "row_missing"      // expect a row, none found
-	ConflictRowExists      ConflictKind = "row_exists"       // expect no row (insert), found one
-	ConflictRowMismatch    ConflictKind = "row_mismatch"     // value differs
-	ConflictKeyMissing     ConflictKind = "key_missing"      // key column not in row image
-	ConflictUnsupportedOp  ConflictKind = "unsupported_op"   // op kind we can't check
+	ConflictRowMissing      ConflictKind = "row_missing"    // expect a row, none found
+	ConflictRowExists       ConflictKind = "row_exists"     // expect no row (insert), found one
+	ConflictRowMismatch     ConflictKind = "row_mismatch"   // value differs
+	ConflictKeyMissing      ConflictKind = "key_missing"    // key column not in row image
+	ConflictUnsupportedOp   ConflictKind = "unsupported_op" // op kind we can't check
 	ConflictInstanceDiffers ConflictKind = "instance_differs"
 )
 
@@ -66,13 +65,13 @@ func (r Row) Get(column string) (core.Value, bool) {
 
 // Conflict is one precondition failure that blocks apply.
 type Conflict struct {
-	OperationSequence int             `json:"operation_sequence"`
-	Table             core.TableRef   `json:"table"`
-	Kind              ConflictKind    `json:"kind"`
-	Column            string          `json:"column,omitempty"`
-	Expected          core.Value      `json:"expected,omitempty"`
-	Actual            core.Value      `json:"actual,omitempty"`
-	Message           string          `json:"message"`
+	OperationSequence int           `json:"operation_sequence"`
+	Table             core.TableRef `json:"table"`
+	Kind              ConflictKind  `json:"kind"`
+	Column            string        `json:"column,omitempty"`
+	Expected          core.Value    `json:"expected,omitempty"`
+	Actual            core.Value    `json:"actual,omitempty"`
+	Message           string        `json:"message"`
 }
 
 // CheckResult is the full check outcome for one plan.
@@ -272,97 +271,10 @@ func compareRow(seq int, table core.TableRef, expect core.Row, current Row) []Co
 	return out
 }
 
-// valuesEqual compares two core.Value instances by parsing the JSON
-// form of each Data field and comparing the resulting Go values. This
-// is the only reliable way to bridge the small differences between how
-// the binlog path (raw JSON number) and the read path (JSON-encoded
-// string) store values, without making each decoder guess at the
-// other's format.
+// valuesEqual compares the canonical typed form without lossy numeric
+// coercion. Both the binlog and SELECT paths use the same decoder.
 func valuesEqual(a, b core.Value) bool {
-	if a.Null && b.Null {
-		return true
-	}
-	if a.Null != b.Null {
-		return false
-	}
-	// Parse both as JSON. After parsing, a value of "16" and 16 are
-	// the same Go value.
-	av, errA := jsonValue(a.Data)
-	bv, errB := jsonValue(b.Data)
-	if errA != nil || errB != nil {
-		// Fall back to byte equality so a corrupted value still
-		// shows up as a deterministic mismatch.
-		return string(a.Data) == string(b.Data)
-	}
-	return jsonScalarEqual(av, bv)
-}
-
-// jsonValue parses a raw JSON byte slice into an interface{}. Strings
-// like "16" (with quotes) parse as Go string; "16" without quotes
-// parses as float64. We accept both.
-func jsonValue(b core.RawJSON) (interface{}, error) {
-	if len(b) == 0 {
-		return nil, fmt.Errorf("empty value")
-	}
-	var v interface{}
-	if err := json.Unmarshal(b, &v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
-// jsonScalarEqual compares two JSON-parsed values using semantically
-// appropriate rules: numeric kinds compare with type promotion so
-// integer 7 equals float64 7, strings compare exactly, booleans by
-// value, null matches null.
-func jsonScalarEqual(a, b interface{}) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	// Coerce numeric values so 7 and 7.0 compare equal.
-	af, aok := toFloat(a)
-	bf, bok := toFloat(b)
-	if aok && bok {
-		return af == bf
-	}
-	return a == b
-}
-
-func toFloat(v interface{}) (float64, bool) {
-	switch x := v.(type) {
-	case float64:
-		return x, true
-	case float32:
-		return float64(x), true
-	case int:
-		return float64(x), true
-	case int32:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	case uint:
-		return float64(x), true
-	case uint32:
-		return float64(x), true
-	case uint64:
-		return float64(x), true
-	case json.Number:
-		f, err := x.Float64()
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	}
-	return 0, false
-}
-
-func isNumeric(k core.ValueKind) bool {
-	switch k {
-	case core.KindInteger, core.KindDecimal, core.KindFloat:
-		return true
-	}
-	return false
+	// Compare the canonical typed representation exactly. Converting JSON
+	// numbers through float64 can make adjacent BIGINT values appear equal.
+	return a.Equal(b)
 }

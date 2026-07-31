@@ -43,7 +43,7 @@ func NewCheckReader(targetDSN, instanceID string) *CheckReader {
 func NewCheckReaderFromBackend(b *Backend) *CheckReader {
 	return &CheckReader{
 		targetDSN:  b.targetDSN,
-		instanceID: b.instanceID,
+		instanceID: b.targetInstanceID,
 		inspector:  schema.NewInspector(b.targetDSN),
 	}
 }
@@ -74,7 +74,7 @@ func (r *CheckReader) ReadByKey(ctx context.Context, t core.TableRef, keyColumns
 	colNames := make([]string, 0, len(cols))
 	colTypes := make([]mysqlvalue.ColumnType, 0, len(cols))
 	for _, c := range cols {
-		colNames = append(colNames, "`"+c.Name+"`")
+		colNames = append(colNames, quoteIdent(c.Name))
 		colTypes = append(colTypes, mysqlvalue.ColumnType{
 			Database:   t.Schema,
 			Table:      t.Name,
@@ -84,19 +84,22 @@ func (r *CheckReader) ReadByKey(ctx context.Context, t core.TableRef, keyColumns
 			Charset:    c.Charset,
 		})
 	}
-	where := make([]string, 0, len(keyColumns))
-	args := make([]interface{}, 0, len(keyColumns))
+	keyRow := core.Row{Columns: make([]string, 0, len(keyColumns)), Values: make([]core.Value, 0, len(keyColumns))}
 	for _, kc := range keyColumns {
 		v, ok := key.Get(kc)
 		if !ok {
 			return executor.Row{}, false, fmt.Errorf("mysql: key column %q missing from key image", kc)
 		}
-		where = append(where, "`"+kc+"` = ?")
-		args = append(args, valueToDriverArg(v))
+		keyRow.Columns = append(keyRow.Columns, kc)
+		keyRow.Values = append(keyRow.Values, v)
+	}
+	where, args, err := buildPredicate(keyRow)
+	if err != nil {
+		return executor.Row{}, false, fmt.Errorf("mysql: key predicate: %w", err)
 	}
 	query := "SELECT " + strings.Join(colNames, ", ") +
-		" FROM `" + t.Schema + "`.`" + t.Name + "`" +
-		" WHERE " + strings.Join(where, " AND ") +
+		" FROM " + quoteIdent(t.Schema) + "." + quoteIdent(t.Name) +
+		" WHERE " + where +
 		" LIMIT 1"
 
 	db, err := sql.Open("mysql", r.targetDSN)
@@ -145,46 +148,6 @@ func columnsByName(sch core.TableSchema) []core.ColumnDef {
 	// We need ordered output, but the schema already gives us columns
 	// in ordinal order from the inspector.
 	return sch.Columns
-}
-
-// valueToDriverArg converts a core.Value into a Go value the MySQL
-// driver will accept as a query argument.
-func valueToDriverArg(v core.Value) interface{} {
-	if v.Null {
-		return nil
-	}
-	switch v.Kind {
-	case core.KindInteger, core.KindDecimal, core.KindFloat:
-		// Driver accepts string for DECIMAL; for integer we pass raw
-		// JSON number.
-		return []byte(v.Data)
-	case core.KindText, core.KindEnum, core.KindSet:
-		return string(v.Data)
-	case core.KindBinary, core.KindBit:
-		// Binary is base64; we need the raw bytes. For BIT we keep
-		// the decimal form because the driver doesn't accept raw
-		// bytes for bit columns reliably.
-		if v.Kind == core.KindBinary {
-			return unquoteJSONString(string(v.Data))
-		}
-		return string(v.Data)
-	case core.KindDate, core.KindTime, core.KindDateTime:
-		return string(v.Data)
-	case core.KindJSON:
-		return unquoteJSONString(string(v.Data))
-	default:
-		return string(v.Data)
-	}
-}
-
-func unquoteJSONString(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		out := s[1 : len(s)-1]
-		out = strings.ReplaceAll(out, `\"`, `"`)
-		out = strings.ReplaceAll(out, `\\`, `\`)
-		return out
-	}
-	return s
 }
 
 // yesNo mirrors value.yesNo without an import cycle. Kept here so the

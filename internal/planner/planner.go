@@ -26,8 +26,8 @@ import (
 type Mode string
 
 const (
-	ModeRevert   Mode = "revert"
-	ModeReapply  Mode = "reapply"
+	ModeRevert  Mode = "revert"
+	ModeReapply Mode = "reapply"
 )
 
 // ExecutionClass marks whether the plan is safe by default or carries
@@ -46,17 +46,17 @@ const FormatVersion = 1
 // a superset of ports.Plan: it adds the digest, fingerprint map,
 // plan id, and provenance that the file format requires.
 type Plan struct {
-	FormatVersion    int                       `json:"format_version"`
-	PlanID           string                    `json:"plan_id"`
-	Mode             Mode                      `json:"mode"`
-	ExecutionClass   ExecutionClass            `json:"execution_class"`
-	CreatedAt        time.Time                 `json:"created_at"`
-	ToolVersion      string                    `json:"tool_version"`
-	Source           core.TransactionRef       `json:"source"`
-	SchemaFingerprints map[string]string       `json:"schema_fingerprints"`
-	Operations       []ports.PlanOperation     `json:"operations"`
-	BackendExtensions map[string]json.RawMessage `json:"backend_extensions,omitempty"`
-	Digest           string                    `json:"digest"`
+	FormatVersion      int                        `json:"format_version"`
+	PlanID             string                     `json:"plan_id"`
+	Mode               Mode                       `json:"mode"`
+	ExecutionClass     ExecutionClass             `json:"execution_class"`
+	CreatedAt          time.Time                  `json:"created_at"`
+	ToolVersion        string                     `json:"tool_version"`
+	Source             core.TransactionRef        `json:"source"`
+	SchemaFingerprints map[string]string          `json:"schema_fingerprints"`
+	Operations         []ports.PlanOperation      `json:"operations"`
+	BackendExtensions  map[string]json.RawMessage `json:"backend_extensions,omitempty"`
+	Digest             string                     `json:"digest"`
 }
 
 // Deps is what Build needs. The caller wires concrete values.
@@ -201,10 +201,31 @@ func buildOperations(txn *core.Transaction, mode Mode, deps Deps) ([]ports.PlanO
 		if err != nil {
 			return nil, nil, err
 		}
+		sch, err := getSchema(rc.Table)
+		if err != nil {
+			return nil, nil, err
+		}
+		op.Write = withoutGeneratedColumns(op.Write, sch)
 		op.Sequence = i + 1
 		ops = append(ops, op)
 	}
 	return ops, fingerprints, nil
+}
+
+func withoutGeneratedColumns(row core.Row, sch core.TableSchema) core.Row {
+	generated := make(map[string]bool)
+	for _, col := range sch.Columns {
+		generated[col.Name] = col.Generated
+	}
+	out := core.Row{Columns: make([]string, 0, len(row.Columns)), Values: make([]core.Value, 0, len(row.Values))}
+	for i, col := range row.Columns {
+		if generated[col] || i >= len(row.Values) {
+			continue
+		}
+		out.Columns = append(out.Columns, col)
+		out.Values = append(out.Values, row.Values[i])
+	}
+	return out
 }
 
 func rowForKey(rc core.RowChange) core.Row {
@@ -219,7 +240,7 @@ func rowForKey(rc core.RowChange) core.Row {
 
 func buildOne(rc core.RowChange, mode Mode, key ports.UniqueKey) (ports.PlanOperation, error) {
 	keyRow := projectKey(rowForKey(rc), key)
-	if !keyRowComplete(keyRow) {
+	if len(keyRow.Columns) != len(key.Columns) || len(keyRow.Values) != len(key.Columns) {
 		return ports.PlanOperation{}, fmt.Errorf("planner: %s row image missing all key columns %v", rc.Table, key.Columns)
 	}
 	op := ports.PlanOperation{
@@ -298,9 +319,7 @@ func selectUniqueKey(sch core.TableSchema, row core.Row) (ports.UniqueKey, error
 			return k, nil
 		}
 	}
-	// Last resort: any key present in the image. The executor will
-	// still find the row, but the planner flags risk via the error.
-	return keys[0], nil
+	return ports.UniqueKey{}, fmt.Errorf("planner: %s has no complete non-NULL unique key in the row image", sch.Table)
 }
 
 func projectKey(row core.Row, key ports.UniqueKey) core.Row {
@@ -317,10 +336,6 @@ func projectKey(row core.Row, key ports.UniqueKey) core.Row {
 		out.Values = append(out.Values, v)
 	}
 	return out
-}
-
-func keyRowComplete(r core.Row) bool {
-	return len(r.Columns) > 0
 }
 
 func allPresentInRow(cols []string, row core.Row) bool {

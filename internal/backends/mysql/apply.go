@@ -25,24 +25,29 @@ import (
 // ApplyWriter executes plans against a target MySQL instance. It owns
 // the InnoDB transaction and the marker write.
 type ApplyWriter struct {
-	targetDSN  string
-	instanceID string
-	inspector  *schema.Inspector
+	targetDSN       string
+	instanceID      string
+	inspector       *schema.Inspector
+	lockWaitTimeout time.Duration
 }
 
 // NewApplyWriter wires a writer to the target DSN.
-func NewApplyWriter(targetDSN, instanceID string) *ApplyWriter {
+func NewApplyWriter(targetDSN, instanceID string, lockWaitTimeout time.Duration) *ApplyWriter {
+	if lockWaitTimeout <= 0 {
+		lockWaitTimeout = 5 * time.Second
+	}
 	return &ApplyWriter{
-		targetDSN:  targetDSN,
-		instanceID: instanceID,
-		inspector:  schema.NewInspector(targetDSN),
+		targetDSN:       targetDSN,
+		instanceID:      instanceID,
+		inspector:       schema.NewInspector(targetDSN),
+		lockWaitTimeout: lockWaitTimeout,
 	}
 }
 
 // NewApplyWriterFromBackend pulls the target DSN and instance id out
 // of a Backend.
 func NewApplyWriterFromBackend(b *Backend) *ApplyWriter {
-	return NewApplyWriter(b.targetDSN, b.instanceID)
+	return NewApplyWriter(b.targetDSN, b.targetInstanceID, b.policy.LockWaitTimeout)
 }
 
 // Apply runs the plan in a single transaction. The execution_class
@@ -86,6 +91,13 @@ func (w *ApplyWriter) Apply(ctx context.Context, plan *ports.Plan, opts executor
 	}
 	defer rollback()
 
+	// Acquire metadata locks for every target table, then re-check the
+	// fingerprints while those locks are held. This closes the schema race
+	// between the pre-apply check and the first row write.
+	if err := w.lockAndCheckSchemas(ctx, conn, plan); err != nil {
+		return ports.ExecutionResult{}, err
+	}
+
 	// 1. Insert action marker. UNIQUE(plan_id) is what stops a re-apply.
 	if err := w.insertMarker(ctx, conn, plan, opts); err != nil {
 		return ports.ExecutionResult{}, err
@@ -103,25 +115,60 @@ func (w *ApplyWriter) Apply(ctx context.Context, plan *ports.Plan, opts executor
 	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return ports.ExecutionResult{}, fmt.Errorf("mysql apply: commit: %w", err)
+		// A transport failure around COMMIT does not prove rollback. The
+		// action marker is in the same transaction, so callers can use it
+		// to resolve the outcome before any retry.
+		return ports.ExecutionResult{}, fmt.Errorf("%w: action_id=%s: %v", ports.ErrCommitUnknown, encodeHex(opts.ActionID), err)
 	}
 	committed = true
 
-	// 3. GTID is only assigned at commit time. Read it after.
-	// We re-open a short-lived connection on the same DSN so the
-	// session state doesn't leak between applies.
-	gtid, _ := readGTIDAfterCommit(ctx, w.targetDSN, opts.SourceNativeTransactionID)
-
 	return ports.ExecutionResult{
-		CompensatingGTID: gtid,
+		// Do not guess this from @@global.gtid_executed: another concurrent
+		// transaction may own the newest GTID. The marker/binlog correlation
+		// path will populate it when action inspection is implemented.
+		CompensatingGTID: "",
 		AffectedRows:     affected,
 		ActionID:         encodeHex(opts.ActionID),
 	}, nil
 }
 
+func (w *ApplyWriter) lockAndCheckSchemas(ctx context.Context, conn *sql.Conn, plan *ports.Plan) error {
+	seen := make(map[core.TableRef]struct{})
+	for _, op := range plan.Operations {
+		if _, ok := seen[op.Table]; ok {
+			continue
+		}
+		seen[op.Table] = struct{}{}
+		q := "SELECT 1 FROM " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " LIMIT 0 FOR UPDATE"
+		rows, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			return fmt.Errorf("mysql apply: metadata lock %s: %w", op.Table, err)
+		}
+		_ = rows.Close()
+	}
+	for table := range seen {
+		want, ok := plan.SchemaFingerprints[table.Schema+"."+table.Name]
+		if !ok || want == "" {
+			return fmt.Errorf("mysql apply: missing schema fingerprint for %s", table)
+		}
+		got, err := w.inspector.Fingerprint(ctx, table)
+		if err != nil {
+			return fmt.Errorf("mysql apply: fingerprint %s: %w", table, err)
+		}
+		if string(got) != want {
+			return fmt.Errorf("%w: %s changed after pre-apply check", ports.ErrSchemaMismatch, table)
+		}
+	}
+	return nil
+}
+
 func (w *ApplyWriter) beginTx(ctx context.Context, conn *sql.Conn) error {
 	// Keep lock waits short so a stuck row doesn't hang the CLI.
-	if _, err := conn.ExecContext(ctx, "SET innodb_lock_wait_timeout = 5"); err != nil {
+	seconds := int64(w.lockWaitTimeout / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET innodb_lock_wait_timeout = %d", seconds)); err != nil {
 		return fmt.Errorf("mysql apply: set lock wait timeout: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "START TRANSACTION"); err != nil {
@@ -189,17 +236,17 @@ func (w *ApplyWriter) applyOp(ctx context.Context, conn *sql.Conn, op ports.Plan
 }
 
 func (w *ApplyWriter) lockForOp(ctx context.Context, conn *sql.Conn, op ports.PlanOperation) error {
-	where, args := buildKeyWhere(op.Key)
-	var query string
-	if op.Kind == core.OpInsert {
-		// Expectation: no row exists. SELECT FOR UPDATE locks the gap
-		// so another transaction can't slip an INSERT in before ours.
-		query = "SELECT 1 FROM `" + op.Table.Schema + "`.`" + op.Table.Name + "` WHERE " + where + " FOR UPDATE"
-	} else {
-		query = "SELECT 1 FROM `" + op.Table.Schema + "`.`" + op.Table.Name + "` WHERE " + where + " FOR UPDATE"
+	where, args, err := buildPredicate(op.Key)
+	if err != nil {
+		return fmt.Errorf("mysql apply: key predicate: %w", err)
 	}
+	// For INSERT, locking the unique-key gap prevents another transaction
+	// from inserting the same key before our INSERT. For existing rows, the
+	// full expect image is checked by the write itself while this key lock is
+	// held.
+	query := "SELECT 1 FROM " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " WHERE " + where + " FOR UPDATE"
 	var x int
-	err := conn.QueryRowContext(ctx, query, args...).Scan(&x)
+	err = conn.QueryRowContext(ctx, query, args...).Scan(&x)
 	switch {
 	case err == nil:
 		if op.Kind == core.OpInsert {
@@ -225,9 +272,13 @@ func (w *ApplyWriter) writeInsert(ctx context.Context, conn *sql.Conn, op ports.
 	placeholders = placeholders[:len(placeholders)-1]
 	args := make([]interface{}, len(op.Write.Values))
 	for i, v := range op.Write.Values {
-		args[i] = writeArg(v)
+		arg, err := driverValue(v)
+		if err != nil {
+			return 0, fmt.Errorf("mysql apply: insert value: %w", err)
+		}
+		args[i] = arg
 	}
-	q := "INSERT INTO `" + op.Table.Schema + "`.`" + op.Table.Name + "` (" + cols + ") VALUES (" + placeholders + ")"
+	q := "INSERT INTO " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " (" + cols + ") VALUES (" + placeholders + ")"
 	res, err := conn.ExecContext(ctx, q, args...)
 	if err != nil {
 		var me *mysql.MySQLError
@@ -244,8 +295,11 @@ func (w *ApplyWriter) writeInsert(ctx context.Context, conn *sql.Conn, op ports.
 }
 
 func (w *ApplyWriter) writeDelete(ctx context.Context, conn *sql.Conn, op ports.PlanOperation) (int, error) {
-	where, args := buildKeyWhere(op.Key)
-	q := "DELETE FROM `" + op.Table.Schema + "`.`" + op.Table.Name + "` WHERE " + where
+	where, args, err := buildPredicate(op.Key, op.Expect)
+	if err != nil {
+		return 0, fmt.Errorf("mysql apply: delete predicate: %w", err)
+	}
+	q := "DELETE FROM " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " WHERE " + where
 	res, err := conn.ExecContext(ctx, q, args...)
 	if err != nil {
 		return 0, fmt.Errorf("mysql apply: delete: %w", err)
@@ -265,32 +319,23 @@ func (w *ApplyWriter) writeUpdate(ctx context.Context, conn *sql.Conn, op ports.
 	sets := make([]string, 0, len(op.Write.Columns))
 	args := make([]interface{}, 0, len(op.Write.Values))
 	for i, c := range op.Write.Columns {
-		sets = append(sets, "`"+c+"` = ?")
-		args = append(args, writeArg(op.Write.Values[i]))
+		sets = append(sets, quoteIdent(c)+" = ?")
+		arg, err := driverValue(op.Write.Values[i])
+		if err != nil {
+			return 0, fmt.Errorf("mysql apply: update value: %w", err)
+		}
+		args = append(args, arg)
 	}
 	// WHERE: key columns + every expect column. The expect image is
 	// what the plan saw at create time; if any has drifted, the
 	// UPDATE matches no row and we surface a conflict.
-	whereParts := make([]string, 0, len(op.Key.Columns)+len(op.Expect.Columns))
-	for _, kc := range op.Key.Columns {
-		whereParts = append(whereParts, "`"+kc+"` = ?")
-		if v, ok := op.Key.Get(kc); ok {
-			args = append(args, writeArg(v))
-		} else {
-			args = append(args, nil)
-		}
+	where, whereArgs, err := buildPredicate(op.Key, op.Expect)
+	if err != nil {
+		return 0, fmt.Errorf("mysql apply: update predicate: %w", err)
 	}
-	for i, ec := range op.Expect.Columns {
-		// Skip columns that are part of the key; they were already
-		// included via op.Key.
-		if _, isKey := op.Key.Get(ec); isKey {
-			continue
-		}
-		whereParts = append(whereParts, "`"+ec+"` = ?")
-		args = append(args, writeArg(op.Expect.Values[i]))
-	}
-	q := "UPDATE `" + op.Table.Schema + "`.`" + op.Table.Name + "` SET " + strings.Join(sets, ", ") +
-		" WHERE " + strings.Join(whereParts, " AND ")
+	args = append(args, whereArgs...)
+	q := "UPDATE " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " SET " + strings.Join(sets, ", ") +
+		" WHERE " + where
 	res, err := conn.ExecContext(ctx, q, args...)
 	if err != nil {
 		return 0, fmt.Errorf("mysql apply: update: %w", err)
@@ -302,52 +347,10 @@ func (w *ApplyWriter) writeUpdate(ctx context.Context, conn *sql.Conn, op ports.
 	return int(n), nil
 }
 
-// buildKeyWhere renders "col1 = ? AND col2 = ?" for the key columns,
-// plus the driver-compatible value list.
-func buildKeyWhere(key core.Row) (string, []interface{}) {
-	parts := make([]string, 0, len(key.Columns))
-	args := make([]interface{}, 0, len(key.Values))
-	for i, c := range key.Columns {
-		parts = append(parts, "`"+c+"` = ?")
-		if i < len(key.Values) {
-			args = append(args, writeArg(key.Values[i]))
-		} else {
-			args = append(args, nil)
-		}
-	}
-	return strings.Join(parts, " AND "), args
-}
-
-// writeArg converts a core.Value into a driver-acceptable Go value
-// for INSERT/UPDATE statements.
-func writeArg(v core.Value) interface{} {
-	if v.Null {
-		return nil
-	}
-	switch v.Kind {
-	case core.KindText, core.KindEnum, core.KindSet,
-		core.KindDate, core.KindTime, core.KindDateTime,
-		core.KindDecimal, core.KindFloat:
-		return string(v.Data)
-	case core.KindInteger:
-		// Already canonical: 16 not "16".
-		return []byte(v.Data)
-	case core.KindBinary, core.KindBit:
-		if v.Kind == core.KindBinary {
-			return unquoteJSONString(string(v.Data))
-		}
-		return string(v.Data)
-	case core.KindJSON:
-		return unquoteJSONString(string(v.Data))
-	default:
-		return string(v.Data)
-	}
-}
-
 func quoteNames(cols []string) string {
 	out := make([]string, len(cols))
 	for i, c := range cols {
-		out[i] = "`" + c + "`"
+		out[i] = quoteIdent(c)
 	}
 	return strings.Join(out, ", ")
 }
@@ -364,60 +367,6 @@ func nullString(s string) interface{} {
 		return nil
 	}
 	return s
-}
-
-func readSessionGTID(ctx context.Context, conn *sql.Conn) (string, error) {
-	row := conn.QueryRowContext(ctx, "SELECT @@session.gtid_executed")
-	var s string
-	if err := row.Scan(&s); err != nil {
-		return "", err
-	}
-	return lastGTID(s), nil
-}
-
-// readGTIDAfterCommit is used after the apply transaction has
-// committed. We open a short-lived connection to ask MySQL which
-// GTID it recorded for our action marker. The marker table is the
-// authoritative source.
-func readGTIDAfterCommit(ctx context.Context, dsn, sourceTxn string) (string, error) {
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return "", err
-	}
-	defer db.Close()
-	// @@global.gtid_executed now includes our just-committed GTID.
-	// The most recent range tail is the GTID we generated.
-	row := db.QueryRowContext(ctx, "SELECT @@global.gtid_executed")
-	var s string
-	if err := row.Scan(&s); err != nil {
-		return "", err
-	}
-	gtid := lastGTID(s)
-	if gtid == "" {
-		return "", nil
-	}
-	return gtid, nil
-}
-
-func lastGTID(s string) string {
-	parts := strings.Split(s, ",")
-	if len(parts) == 0 {
-		return ""
-	}
-	last := strings.TrimSpace(parts[len(parts)-1])
-	if last == "" {
-		return ""
-	}
-	colon := strings.LastIndex(last, ":")
-	if colon < 0 {
-		return last
-	}
-	uuid := last[:colon]
-	seq := last[colon+1:]
-	if dash := strings.Index(seq, "-"); dash >= 0 {
-		seq = seq[dash+1:]
-	}
-	return uuid + ":" + seq
 }
 
 func (w *ApplyWriter) confirm(want, planDigest string) error {
@@ -480,6 +429,3 @@ func unhex(c byte) (byte, bool) {
 	}
 	return 0, false
 }
-
-// silence unused
-var _ = time.Second

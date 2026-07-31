@@ -11,6 +11,12 @@ import (
 // restrictive file permissions. The on-disk file is what `plan check`
 // and `plan apply` consume; it must be byte-stable.
 func WriteFile(p *Plan, path string) error {
+	return WriteFileLimited(p, path, 0)
+}
+
+// WriteFileLimited is WriteFile with a hard encoded-size ceiling. A zero
+// limit disables the ceiling. The check happens before creating the file.
+func WriteFileLimited(p *Plan, path string, maxBytes int64) error {
 	if p == nil {
 		return fmt.Errorf("planner: nil plan")
 	}
@@ -28,6 +34,9 @@ func WriteFile(p *Plan, path string) error {
 	pretty, err := stablePretty(raw)
 	if err != nil {
 		return fmt.Errorf("planner: pretty: %w", err)
+	}
+	if maxBytes > 0 && int64(len(pretty)+1) > maxBytes {
+		return fmt.Errorf("planner: encoded plan is %d bytes, exceeds limit %d", len(pretty)+1, maxBytes)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("planner: mkdir: %w", err)

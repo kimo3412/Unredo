@@ -131,6 +131,17 @@ func TestPlanReadWriteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteFileLimitedRejectsOversizePlan(t *testing.T) {
+	txn := sampleTxn(t, []core.RowChange{mkRow(1, core.OpInsert, core.Row{}, sampleOrders())})
+	p, err := Build(txn, ModeRevert, depsFor(t, sampleOrdersSchema()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileLimited(p, t.TempDir()+"/too-large.json", 1); err == nil {
+		t.Fatal("expected plan size limit error")
+	}
+}
+
 func TestUniqueKeySelectionPicksPrimary(t *testing.T) {
 	sch := sampleOrdersSchema()
 	key, err := selectUniqueKey(sch, sampleOrders())
@@ -142,6 +153,21 @@ func TestUniqueKeySelectionPicksPrimary(t *testing.T) {
 	}
 	if len(key.Columns) == 0 || key.Columns[0] != "id" {
 		t.Errorf("expected id column, got %v", key.Columns)
+	}
+}
+
+func TestUniqueKeySelectionRejectsIncompleteCompositeKey(t *testing.T) {
+	sch := core.TableSchema{
+		Table: core.TableRef{Schema: "shop", Name: "legacy"},
+		Columns: []core.ColumnDef{
+			{Name: "tenant_id", Nullable: false},
+			{Name: "row_id", Nullable: false},
+		},
+		UniqueKeys: []core.UniqueKey{{Name: "PRIMARY", IsPrimary: true, Columns: []string{"tenant_id", "row_id"}}},
+	}
+	row := core.Row{Columns: []string{"tenant_id"}, Values: []core.Value{{Kind: core.KindInteger, Data: core.RawJSON(`1`)}}}
+	if _, err := selectUniqueKey(sch, row); err == nil {
+		t.Fatal("expected incomplete composite key to be rejected")
 	}
 }
 

@@ -6,6 +6,7 @@ package source
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,35 +31,64 @@ type Source struct {
 	instanceID string
 	serverID   uint32
 	inspector  *schema.Inspector
+	maxRows    int
+	maxBytes   int64
 }
 
 // New builds a Source. serverID must be a non-zero, profile-unique value.
-func New(dsn, instanceID string, serverID uint32) *Source {
+func New(dsn, instanceID string, serverID uint32, maxRows int, maxBytes int64) *Source {
 	return &Source{
 		dsn:        dsn,
 		instanceID: instanceID,
 		serverID:   serverID,
 		inspector:  schema.NewInspector(dsn),
+		maxRows:    maxRows,
+		maxBytes:   maxBytes,
 	}
 }
 
-// Capabilities reports the MySQL 8 ROW/FULL/GTID baseline.
-func (s *Source) Capabilities(_ context.Context) (core.BackendCapabilities, error) {
+// Capabilities reports what the connected server actually provides.
+func (s *Source) Capabilities(ctx context.Context) (core.BackendCapabilities, error) {
+	format, rowImage, gtid, rowMetadata, err := s.settings(ctx)
+	if err != nil {
+		return core.BackendCapabilities{}, err
+	}
+	rowFull := strings.EqualFold(format, "ROW") && strings.EqualFold(rowImage, "FULL")
+	gtidOn := strings.EqualFold(gtid, "ON")
+	metadataFull := strings.EqualFold(rowMetadata, "FULL")
 	return core.BackendCapabilities{
-		FullBeforeImage:       true,
-		FullAfterImage:        true,
-		StableTransactionID:   true,
-		TransactionBoundaries: true,
+		FullBeforeImage:       rowFull,
+		FullAfterImage:        rowFull,
+		StableTransactionID:   gtidOn,
+		TransactionBoundaries: strings.EqualFold(format, "ROW"),
 		AtomicActionMarker:    true,
-		SchemaAtEventTime:     true,
-		SupportsReapply:       true,
+		SchemaAtEventTime:     metadataFull,
+		SupportsReapply:       rowFull,
 	}, nil
+}
+
+func (s *Source) settings(ctx context.Context) (format, rowImage, gtid, rowMetadata string, err error) {
+	db, err := sql.Open("mysql", s.dsn)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	defer db.Close()
+	err = db.QueryRowContext(ctx,
+		"SELECT @@global.binlog_format, @@global.binlog_row_image, @@global.gtid_mode, @@global.binlog_row_metadata").Scan(&format, &rowImage, &gtid, &rowMetadata)
+	return
 }
 
 // Scan opens a replication stream and returns an iterator.
 func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.TransactionIterator, error) {
 	if s.serverID == 0 {
 		return nil, fmt.Errorf("mysql: source.server_id is 0; set a non-zero value in the profile")
+	}
+	caps, err := s.Capabilities(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: inspect binlog capabilities: %w", err)
+	}
+	if !caps.FullBeforeImage || !caps.FullAfterImage || !caps.StableTransactionID || !caps.SchemaAtEventTime {
+		return nil, fmt.Errorf("mysql: ROW/FULL/GTID with binlog_row_metadata=FULL required: %w", ports.ErrUnsupportedCapability)
 	}
 	host, port, user, pass, err := parseDSN(s.dsn)
 	if err != nil {
@@ -90,6 +120,8 @@ func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.Transac
 		instanceID: s.instanceID,
 		inspector:  s.inspector,
 		limit:      scope.Limit,
+		maxRows:    s.maxRows,
+		maxBytes:   s.maxBytes,
 		colCache:   map[string][]columnInfo{},
 	}, nil
 }
@@ -212,6 +244,12 @@ type binlogIterator struct {
 	colCache  map[string][]columnInfo
 	emitted   int
 	limit     int
+	exhausted bool
+	maxRows   int
+	maxBytes  int64
+	rowCount  int
+	rowBytes  int64
+	tooLarge  bool
 }
 
 func (b *binlogIterator) Close() error {
@@ -221,6 +259,9 @@ func (b *binlogIterator) Close() error {
 
 func (b *binlogIterator) Next(ctx context.Context) (*core.Transaction, error) {
 	for {
+		if b.exhausted {
+			return nil, io.EOF
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -233,10 +274,13 @@ func (b *binlogIterator) Next(ctx context.Context) (*core.Transaction, error) {
 			out := b.current
 			b.current = nil
 			b.pending = nil
+			b.rowCount = 0
+			b.rowBytes = 0
+			b.tooLarge = false
 			if b.limit > 0 {
 				b.emitted++
 				if b.emitted >= b.limit {
-					return out, io.EOF
+					b.exhausted = true
 				}
 			}
 			return out, nil
@@ -339,16 +383,30 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 	if err != nil {
 		return err
 	}
+	if len(b.tableMap.ColumnName) != len(cols) {
+		b.current.Executable = false
+		b.current.Reasons = append(b.current.Reasons,
+			fmt.Sprintf("%s event metadata has %d column names, current schema has %d; historical schema cannot be proven", tableRef, len(b.tableMap.ColumnName), len(cols)))
+		return nil
+	}
+	for i, name := range b.tableMap.ColumnName {
+		if string(name) != cols[i].Name {
+			b.current.Executable = false
+			b.current.Reasons = append(b.current.Reasons,
+				fmt.Sprintf("%s event column %d is %q, current schema is %q; historical schema drift", tableRef, i+1, name, cols[i].Name))
+			return nil
+		}
+	}
 	op := opForEventType(ev.Header.EventType)
 	for i := 0; i < len(raw.Rows); {
-		sequence := len(b.pending) + 1
+		sequence := b.rowCount + 1
 		switch op {
 		case core.OpInsert:
 			row, err := buildRow(tableRef, cols, raw.Rows[i])
 			if err != nil {
 				return err
 			}
-			b.pending = append(b.pending, core.RowChange{
+			b.appendChange(core.RowChange{
 				Sequence:  sequence,
 				Table:     tableRef,
 				Operation: op,
@@ -361,7 +419,7 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 			if err != nil {
 				return err
 			}
-			b.pending = append(b.pending, core.RowChange{
+			b.appendChange(core.RowChange{
 				Sequence:  sequence,
 				Table:     tableRef,
 				Operation: op,
@@ -378,7 +436,7 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 			if err != nil {
 				return err
 			}
-			b.pending = append(b.pending, core.RowChange{
+			b.appendChange(core.RowChange{
 				Sequence:  sequence,
 				Table:     tableRef,
 				Operation: op,
@@ -390,6 +448,22 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 		}
 	}
 	return nil
+}
+
+func (b *binlogIterator) appendChange(change core.RowChange) {
+	b.rowCount++
+	if b.tooLarge {
+		return
+	}
+	b.pending = append(b.pending, change)
+	raw, _ := json.Marshal(change)
+	b.rowBytes += int64(len(raw))
+	if (b.maxRows > 0 && b.rowCount > b.maxRows) || (b.maxBytes > 0 && b.rowBytes > b.maxBytes) {
+		b.tooLarge = true
+		b.pending = nil
+		b.current.Executable = false
+		b.current.Reasons = append(b.current.Reasons, fmt.Sprintf("transaction exceeds configured limit (rows=%d bytes=%d)", b.rowCount, b.rowBytes))
+	}
 }
 
 func (b *binlogIterator) handleQuery(ev *replication.BinlogEvent) error {

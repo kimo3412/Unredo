@@ -3,6 +3,8 @@
 > 状态:M2 完成,核心 revert 闭环跑通;M3 (reapply) 与发布待办。
 > 最后更新:2026-07-31
 
+> 2026-07-31 安全加固：apply 现在会针对真实 target 重新检查实例、schema 和 row image；DELETE 使用完整 expect 条件；修复 JSON 字符串、DECIMAL、时间、BLOB、BIT 和 NULL 写回；非交互 apply 强制要求 digest；commit 错误返回 `ErrCommitUnknown`；不再从 `@@global.gtid_executed` 猜测补偿 GTID。新增 UPDATE、DELETE 恢复、BLOB/NULL 和多行冲突零写入的真实 MySQL 集成测试。
+
 ## 1. TL;DR
 
 Unredo 计划成为 MySQL 事务补偿 CLI。本仓库目前已经实现 M0(技术验证)、M1(只读计划)、M2(安全执行)三个里程碑。从一行 INSERT 到 revert 回滚,**端到端用真 MySQL 跑过**,集成测试一发过(0.5s 左右)。
@@ -47,7 +49,7 @@ $env:UNREDO_EXECUTOR_PASSWORD = 'unredo_executor_pw'
 ```
 
 `plan check` 状态:`READY` / `CONFLICT` / `STALE_SCHEMA` / `SOURCE_MISMATCH`。
-`plan apply` 退出 0 即成功,会打印 `action_id` / 补偿事务 GTID / `affected` 行数;重复 apply 同一份 plan 会被 `plan_id` UNIQUE 约束挡掉,报 `ErrApplyReplayed`。
+`plan apply` 退出 0 即成功,会打印 `action_id` / `affected` 行数;重复 apply 同一份 plan 会被 `plan_id` UNIQUE 约束挡掉,报 `ErrApplyReplayed`。补偿 GTID 在 action/binlog 关联功能完成前留空，不能从全局 GTID 尾部猜测。
 
 ## 3. 架构现状
 
@@ -167,7 +169,7 @@ MySQL 驱动给的 `[]byte` 在解码器里统一先 `asString`,再 `json.Marsha
    - UPDATE:`SET write_cols WHERE key AND expect_image` 必须 1 行
    - INSERT:`INSERT ...` 写全行,UNIQUE 错 = 冲突
 5. `COMMIT`
-6. 拿 GTID(新连接读 `@@global.gtid_executed` 末段)
+6. 返回 action ID；补偿 GTID 暂不猜测，后续由 marker/binlog 精确关联
 7. 任意步骤出错 → `defer rollback()` 整笔回滚
 
 MySQL 1062 → `ErrApplyReplayed`,0 affected → `ErrApplyConflict`,都带上下文信息。
@@ -219,8 +221,7 @@ make test-integration
 2. **TIMESTAMP 时区漂移**:DSN 别加 `time_zone='+00:00'`。
 3. **`[]byte` 走 `json.Marshal` 是 base64**:integer 解码要先 `parseIntegerLiteral` 再 `json.Marshal` 数字。
 4. **`conn.ExecContext` 返回 2 个值**:`_, err := ...`,写 `err := ...` 编不过。
-5. **GTID 必须在 COMMIT 后读**:`@@session.gtid_executed` 在事务内是空的。
-6. **`@@global.gtid_executed` 是 range 字符串** `"uuid:1-77"`,取末段:split by `,` 再 split by `-` 取 end。
+5. **不能从 `@@global.gtid_executed` 尾部推断自己的 GTID**：并发事务可能先提交；必须通过 action marker 与 binlog 精确关联。
 7. **`ulid.Entropy()` 返回 `[]byte`**,不是 uint64。
 8. **Cobra 子命令不要 Use 字段里带父前缀**,否则 help 里会出现重复项(我们用嵌套 `txn` / `plan` / `action` 修好)。
 9. **plan 文件要写 canonical JSON**,否则 digest 不能重算。

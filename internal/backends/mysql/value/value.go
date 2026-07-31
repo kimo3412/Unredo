@@ -73,12 +73,12 @@ func kindForType(mysqlType string) core.ValueKind {
 		strings.HasPrefix(t, "tinyblob"), strings.HasPrefix(t, "blob"),
 		strings.HasPrefix(t, "mediumblob"), strings.HasPrefix(t, "longblob"):
 		return core.KindBinary
+	case strings.HasPrefix(t, "datetime"), strings.HasPrefix(t, "timestamp"):
+		return core.KindDateTime
 	case strings.HasPrefix(t, "date"):
 		return core.KindDate
 	case strings.HasPrefix(t, "time"):
 		return core.KindTime
-	case strings.HasPrefix(t, "datetime"), strings.HasPrefix(t, "timestamp"):
-		return core.KindDateTime
 	case strings.HasPrefix(t, "json"):
 		return core.KindJSON
 	case strings.HasPrefix(t, "bit"):

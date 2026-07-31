@@ -13,6 +13,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -31,11 +32,11 @@ import (
 )
 
 const (
-	readerUser = "unredo_reader"
-	readerPass = "unredo_reader_pw"
+	readerUser   = "unredo_reader"
+	readerPass   = "unredo_reader_pw"
 	executorUser = "unredo_executor"
 	executorPass = "unredo_executor_pw"
-	rootPass = "123456"
+	rootPass     = "123456"
 )
 
 func TestEndToEndPlanCreate(t *testing.T) {
@@ -45,6 +46,7 @@ func TestEndToEndPlanCreate(t *testing.T) {
 	mysqlBin := findMySQLBin(t)
 	rootConn := openRoot(t, mysqlBin)
 	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
 	execConn := openExecutor(t, mysqlBin)
 	defer execConn.Close()
 
@@ -176,6 +178,211 @@ func TestEndToEndPlanCreate(t *testing.T) {
 
 	// Re-apply must be blocked by the plan_id UNIQUE.
 	planApply(t, planPath, planner.ShortDigest(plan.Digest), 1, false)
+}
+
+func TestEndToEndRevertUpdateDeleteAndBinary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	marker := fmt.Sprintf("types-%d", time.Now().UnixNano()%100000000)
+	res, err := execConn.Exec(
+		"INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (?, ?, ?)",
+		990001, marker, "10.25",
+	)
+	if err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	orderID, _ := res.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE id = ?", orderID) })
+
+	// UPDATE revert exercises text, decimal and temporal write-back.
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status=?, amount=? WHERE id=?", "changed", "99.75", orderID); err != nil {
+		t.Fatalf("update order: %v", err)
+	}
+	updateGTID, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatePlan := createPlanForGTID(t, rootConn, updateGTID)
+	plan, err := planner.ReadFile(updatePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planApply(t, updatePlan, planner.ShortDigest(plan.Digest), 0, true)
+	var status, amount string
+	if err := execConn.QueryRow("SELECT status, amount FROM unredo_shop.orders WHERE id=?", orderID).Scan(&status, &amount); err != nil {
+		t.Fatal(err)
+	}
+	if status != marker || amount != "10.25" {
+		t.Fatalf("update revert restored status=%q amount=%q; want %q, 10.25", status, amount, marker)
+	}
+
+	// DELETE revert exercises full-row INSERT write-back.
+	if _, err := execConn.Exec("DELETE FROM unredo_shop.orders WHERE id=?", orderID); err != nil {
+		t.Fatalf("delete order: %v", err)
+	}
+	deleteGTID, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletePlan := createPlanForGTID(t, rootConn, deleteGTID)
+	plan, err = planner.ReadFile(deletePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planApply(t, deletePlan, planner.ShortDigest(plan.Digest), 0, true)
+	if err := execConn.QueryRow("SELECT status, amount FROM unredo_shop.orders WHERE id=?", orderID).Scan(&status, &amount); err != nil {
+		t.Fatal(err)
+	}
+	if status != marker || amount != "10.25" {
+		t.Fatalf("delete revert restored status=%q amount=%q", status, amount)
+	}
+
+	// Binary and NULL must survive canonical JSON and SQL binding.
+	res, err = execConn.Exec("INSERT INTO unredo_shop.large_rows (payload, note) VALUES (?, NULL)", []byte{0, 1, 255})
+	if err != nil {
+		t.Fatalf("seed binary: %v", err)
+	}
+	largeID, _ := res.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.large_rows WHERE id = ?", largeID) })
+	if _, err := execConn.Exec("UPDATE unredo_shop.large_rows SET payload=?, note=? WHERE id=?", []byte{9, 8, 7}, "not-null", largeID); err != nil {
+		t.Fatalf("update binary: %v", err)
+	}
+	binaryGTID, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPlan := createPlanForGTID(t, rootConn, binaryGTID)
+	plan, err = planner.ReadFile(binaryPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planApply(t, binaryPlan, planner.ShortDigest(plan.Digest), 0, true)
+	var payload []byte
+	var note sql.NullString
+	if err := execConn.QueryRow("SELECT payload, note FROM unredo_shop.large_rows WHERE id=?", largeID).Scan(&payload, &note); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, []byte{0, 1, 255}) || note.Valid {
+		t.Fatalf("binary revert restored payload=%v note=%#v", payload, note)
+	}
+}
+
+func TestApplyConflictLeavesAllRowsUntouched(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	res1, err := execConn.Exec("INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (991001, 'base-a', 1.00)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1, _ := res1.LastInsertId()
+	res2, err := execConn.Exec("INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (991002, 'base-b', 2.00)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, _ := res2.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE id IN (?, ?)", id1, id2) })
+
+	tx, err := execConn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("UPDATE unredo_shop.orders SET status='changed-a' WHERE id=?", id1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("UPDATE unredo_shop.orders SET status='changed-b' WHERE id=?", id2); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	gtid, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := createPlanForGTID(t, rootConn, gtid)
+	plan, err := planner.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drift only the second row. Apply must fail before reverting the first.
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status='external' WHERE id=?", id2); err != nil {
+		t.Fatal(err)
+	}
+	planApply(t, planPath, planner.ShortDigest(plan.Digest), 1, false)
+	var s1, s2 string
+	if err := execConn.QueryRow("SELECT status FROM unredo_shop.orders WHERE id=?", id1).Scan(&s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := execConn.QueryRow("SELECT status FROM unredo_shop.orders WHERE id=?", id2).Scan(&s2); err != nil {
+		t.Fatal(err)
+	}
+	if s1 != "changed-a" || s2 != "external" {
+		t.Fatalf("conflicting apply changed rows: first=%q second=%q", s1, s2)
+	}
+}
+
+func createPlanForGTID(t *testing.T, rootConn *sql.DB, gtid string) string {
+	t.Helper()
+	binlogFile, err := readCurrentBinlogFile(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := repoRoot(t)
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	cmd := exec.Command(filepath.Join(repoRoot, "bin", "unredo.exe"),
+		"--config", "unredo.yaml", "--profile", "local",
+		"plan", "create", "--binlog", binlogFile, "--from-pos", "4",
+		"--txn", gtid, "--output", planPath)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"UNREDO_READER_PASSWORD="+readerPass,
+		"UNREDO_EXECUTOR_PASSWORD="+executorPass)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("plan create for %s: %v\n%s", gtid, err, out)
+	}
+	return planPath
+}
+
+func latestGTID(db *sql.DB) (string, error) {
+	var s string
+	if err := db.QueryRow("SELECT @@global.gtid_executed").Scan(&s); err != nil {
+		return "", err
+	}
+	parts := strings.Split(s, ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	colon := strings.LastIndex(last, ":")
+	if colon < 0 {
+		return "", fmt.Errorf("malformed GTID set %q", s)
+	}
+	uuid, seq := last[:colon], last[colon+1:]
+	if dash := strings.Index(seq, "-"); dash >= 0 {
+		seq = seq[dash+1:]
+	}
+	return uuid + ":" + seq, nil
+}
+
+func ensureFullRowMetadata(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec("SET GLOBAL binlog_row_metadata = 'FULL'"); err != nil {
+		t.Fatalf("enable binlog_row_metadata=FULL for integration test: %v", err)
+	}
 }
 
 // planApply runs the unredo CLI's apply subcommand and checks the

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -31,9 +32,9 @@ type Check struct {
 
 // Report is the doctor output, also used as `unredo doctor --format=json`.
 type Report struct {
-	ServerUUID  string `json:"server_uuid"`
+	ServerUUID  string    `json:"server_uuid"`
 	GeneratedAt time.Time `json:"generated_at"`
-	Checks      []Check `json:"checks"`
+	Checks      []Check   `json:"checks"`
 }
 
 // Deps lets the CLI pass a context and a max duration.
@@ -45,7 +46,7 @@ type Deps struct {
 // Run executes every check. The result is suitable for both human output
 // and machine parsing. It does not abort early on failures; instead it
 // collects everything so the operator sees the full picture.
-func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, policy config.Policy) (*Report, error) {
+func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, serverID uint32, policy config.Policy) (*Report, error) {
 	if deps == nil {
 		deps = &Deps{Context: context.Background(), Timeout: 30 * time.Second}
 	}
@@ -58,7 +59,7 @@ func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, policy config.Poli
 	}
 
 	if err := openAndCheck(ctx, sourceDSN, "source", r, func(ctx context.Context, db *sql.DB) error {
-		return checkSource(ctx, db, policy, r)
+		return checkSource(ctx, db, serverID, policy, r)
 	}); err != nil {
 		r.Checks = append(r.Checks, Check{
 			Name:     "source.connect",
@@ -107,15 +108,56 @@ func openAndCheck(ctx context.Context, dsn, label string, r *Report, fn func(con
 	return fn(ctx, db)
 }
 
-func checkSource(ctx context.Context, db *sql.DB, policy config.Policy, r *Report) error {
+func checkSource(ctx context.Context, db *sql.DB, serverID uint32, policy config.Policy, r *Report) error {
 	checkVersion(ctx, db, r)
 	checkVariable(ctx, db, r, "log_bin", "ON", true)
 	checkVariable(ctx, db, r, "binlog_format", "ROW", true)
 	checkVariable(ctx, db, r, "binlog_row_image", "FULL", true)
+	checkVariable(ctx, db, r, "binlog_row_metadata", "FULL", true)
 	checkVariable(ctx, db, r, "gtid_mode", "ON", policy.RequireGTID)
 	checkVariable(ctx, db, r, "enforce_gtid_consistency", "ON", policy.RequireGTID)
 	checkReplPrivs(ctx, db, r)
+	checkServerID(ctx, db, serverID, r)
 	return nil
+}
+
+func checkServerID(ctx context.Context, db *sql.DB, serverID uint32, r *Report) {
+	if serverID == 0 {
+		r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityError, Message: "must be a non-zero uint32"})
+		return
+	}
+	var sourceID uint32
+	if err := db.QueryRowContext(ctx, "SELECT @@global.server_id").Scan(&sourceID); err == nil && sourceID == serverID {
+		r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityError, Message: fmt.Sprintf("%d conflicts with source @@server_id", serverID)})
+		return
+	}
+	rows, err := db.QueryContext(ctx, "SHOW REPLICAS")
+	if err != nil {
+		r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityWarn, Message: fmt.Sprintf("%d is valid, but visible replica IDs could not be checked: %v", serverID, err)})
+		return
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil || len(cols) == 0 {
+		r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityWarn, Message: fmt.Sprintf("%d is valid; replica list unavailable", serverID)})
+		return
+	}
+	for rows.Next() {
+		raw := make([]sql.RawBytes, len(cols))
+		dest := make([]interface{}, len(cols))
+		for i := range raw {
+			dest[i] = &raw[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			continue
+		}
+		visible, _ := strconv.ParseUint(string(raw[0]), 10, 32)
+		if uint32(visible) == serverID {
+			r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityError, Message: fmt.Sprintf("%d conflicts with a visible replica", serverID)})
+			return
+		}
+	}
+	r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityOK, Message: fmt.Sprintf("%d; no conflict among visible replicas (best effort)", serverID)})
 }
 
 func checkTarget(_ context.Context, _ *sql.DB, _ config.Policy, _ *Report) error {
