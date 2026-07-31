@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：设计阶段，CLI 尚未实现。完整范围和安全模型参见 [DESIGN.md](./DESIGN.md)。
+> 当前状态：**M0-M2 已完成,核心 revert 闭环跑通**(plan create / check / apply + 集成测试 + 重放保护)。M3 (reapply) 与发布待办。详细进度见 [docs/PROGRESS.md](./docs/PROGRESS.md),完整范围和安全模型见 [DESIGN.md](./DESIGN.md)。
 
 ## 计划中的五分钟上手流程
 
