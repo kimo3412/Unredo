@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -214,20 +219,169 @@ func runPlanApply(cmd *cobra.Command, args []string) error {
 func newPlanResolveCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "resolve",
-		Short: "Produce a resolved plan for a conflict (M2)",
-		RunE:  notImplemented("plan resolve"),
+		Short: "Produce an audited unsafe plan from explicit conflict decisions",
+		RunE:  runPlanResolve,
 		Args:  cobra.MinimumNArgs(1),
 	}
 	c.Flags().String("output", "", "output resolved plan file")
+	c.Flags().String("from-json", "", "non-interactive resolution decision file")
+	c.Flags().String("operator", "", "operator recording the resolution")
+	c.Flags().String("reason", "", "incident or reason for unsafe resolution")
 	return c
 }
 
-func notImplemented(name string) func(cmd *cobra.Command, args []string) error {
-	return func(cmd *cobra.Command, _ []string) error {
-		fmt.Fprintf(cmd.OutOrStdout(),
-			"%s: scheduled for a later milestone (M2 check/apply, M3 reapply). Run `unredo doctor` or `unredo txn list/show` to validate the M0 binlog path.\n", name)
-		return nil
+type resolutionInput struct {
+	Operator    string               `json:"operator"`
+	Reason      string               `json:"reason"`
+	Resolutions []planner.Resolution `json:"resolutions"`
+}
+
+func runPlanResolve(cmd *cobra.Command, args []string) error {
+	parent, err := planner.ReadFile(args[0])
+	if err != nil {
+		return fmt.Errorf("read parent plan: %w", err)
 	}
+	output, _ := cmd.Flags().GetString("output")
+	if output == "" {
+		return fmt.Errorf("--output is required")
+	}
+	backend, profile, err := resolveBackend(cmd)
+	if err != nil {
+		return err
+	}
+	executor, ok := backend.(ports.PlanExecutor)
+	if !ok {
+		return fmt.Errorf("backend %q does not implement PlanExecutor", backend.Name())
+	}
+	ctx, cancel := commandContext(cmd, 30*time.Second)
+	defer cancel()
+	check, err := executor.Check(ctx, *parent.ToPorts())
+	if err != nil {
+		return fmt.Errorf("check parent plan: %w", err)
+	}
+	if check.Status != "CONFLICT" {
+		return fmt.Errorf("parent plan status is %s; only row conflicts can be resolved", check.Status)
+	}
+
+	input, err := collectResolutions(cmd, parent, check)
+	if err != nil {
+		return err
+	}
+	resolved, err := planner.BuildResolved(parent, check, planner.ResolveOptions{
+		Operator: input.Operator, Reason: input.Reason,
+		ToolVersion: toolVersion(), Decisions: input.Resolutions,
+	})
+	if err != nil {
+		return fmt.Errorf("resolve plan: %w", err)
+	}
+	if err := ensureParentDir(output); err != nil {
+		return err
+	}
+	if err := planner.WriteFileLimited(resolved, output, profile.Policy.MaxPlanBytes); err != nil {
+		return fmt.Errorf("write resolved plan: %w", err)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "plan_id:          %s\n", resolved.PlanID)
+	fmt.Fprintf(cmd.OutOrStdout(), "class:            %s\n", resolved.ExecutionClass)
+	fmt.Fprintf(cmd.OutOrStdout(), "digest:           sha256:%s\n", planner.ShortDigest(resolved.Digest))
+	fmt.Fprintf(cmd.OutOrStdout(), "parent_digest:    %s\n", resolved.ParentPlanDigest)
+	fmt.Fprintf(cmd.OutOrStdout(), "resolutions:      %d\n", len(resolved.Resolutions))
+	fmt.Fprintf(cmd.OutOrStdout(), "operations:       %d\n", len(resolved.Operations))
+	fmt.Fprintf(cmd.OutOrStdout(), "written:          %s\n", output)
+	fmt.Fprintf(cmd.OutOrStdout(), "apply requires:   --confirm-sha %s --accept-risk %s\n", planner.ShortDigest(resolved.Digest), planner.ShortDigest(resolved.Digest))
+	return nil
+}
+
+func collectResolutions(cmd *cobra.Command, parent *planner.Plan, check *ports.CheckResult) (*resolutionInput, error) {
+	fromJSON, _ := cmd.Flags().GetString("from-json")
+	operator, _ := cmd.Flags().GetString("operator")
+	reason, _ := cmd.Flags().GetString("reason")
+	var input resolutionInput
+	if fromJSON != "" {
+		file, err := os.Open(fromJSON)
+		if err != nil {
+			return nil, fmt.Errorf("open resolution file: %w", err)
+		}
+		defer file.Close()
+		decoder := json.NewDecoder(io.LimitReader(file, 4*1024*1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			return nil, fmt.Errorf("decode resolution file: %w", err)
+		}
+	} else {
+		var err error
+		input.Resolutions, err = promptResolutions(cmd, parent, check)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if operator != "" {
+		input.Operator = operator
+	}
+	if reason != "" {
+		input.Reason = reason
+	}
+	if input.Operator == "" || input.Reason == "" {
+		return nil, fmt.Errorf("resolution requires --operator and --reason (or operator/reason in --from-json)")
+	}
+	grouped := conflictsBySequence(check.Conflicts)
+	for i := range input.Resolutions {
+		if input.Resolutions[i].ConflictDigest == "" {
+			input.Resolutions[i].ConflictDigest = planner.ConflictDigest(parent.Digest, input.Resolutions[i].OperationSequence, grouped[input.Resolutions[i].OperationSequence])
+		}
+	}
+	return &input, nil
+}
+
+func promptResolutions(cmd *cobra.Command, parent *planner.Plan, check *ports.CheckResult) ([]planner.Resolution, error) {
+	grouped := conflictsBySequence(check.Conflicts)
+	sequences := make([]int, 0, len(grouped))
+	for sequence := range grouped {
+		sequences = append(sequences, sequence)
+	}
+	sort.Ints(sequences)
+	reader := bufio.NewReader(cmd.InOrStdin())
+	out := cmd.OutOrStdout()
+	resolutions := make([]planner.Resolution, 0, len(sequences))
+	for _, sequence := range sequences {
+		conflicts := grouped[sequence]
+		digest := planner.ConflictDigest(parent.Digest, sequence, conflicts)
+		fmt.Fprintf(out, "operation %d conflict %s\n", sequence, digest)
+		for _, conflict := range conflicts {
+			fmt.Fprintf(out, "  %s %s column=%s: %s\n", conflict.Table, conflict.Kind, valueOrDash(conflict.Column), conflict.Message)
+		}
+		fmt.Fprint(out, "decision [skip/overwrite/abort]: ")
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("read resolution: %w", err)
+		}
+		decision := planner.ResolutionDecision(strings.ToLower(strings.TrimSpace(line)))
+		switch decision {
+		case planner.DecisionSkip, planner.DecisionOverwrite:
+		case planner.DecisionAbort:
+			return nil, fmt.Errorf("resolution aborted at operation %d", sequence)
+		default:
+			return nil, fmt.Errorf("invalid decision %q for operation %d", decision, sequence)
+		}
+		resolutions = append(resolutions, planner.Resolution{OperationSequence: sequence, Decision: decision, ConflictDigest: digest})
+	}
+	return resolutions, nil
+}
+
+func conflictsBySequence(conflicts []ports.Conflict) map[int][]ports.Conflict {
+	grouped := make(map[int][]ports.Conflict)
+	for _, conflict := range conflicts {
+		grouped[conflict.OperationSequence] = append(grouped[conflict.OperationSequence], conflict)
+	}
+	return grouped
+}
+
+func commandContext(cmd *cobra.Command, fallback time.Duration) (context.Context, context.CancelFunc) {
+	timeoutValue, _ := cmd.Flags().GetString("timeout")
+	duration, err := time.ParseDuration(timeoutValue)
+	if err != nil || duration <= 0 {
+		duration = fallback
+	}
+	return context.WithTimeout(cmd.Context(), duration)
 }
 
 // runPlanCreate reads a transaction from the binlog, asks the planner

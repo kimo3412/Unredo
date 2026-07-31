@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**M0-M2 已完成，M3 核心 reapply 闭环已跑通**（action show / reapply + action 链校验 + 真实 MySQL 集成测试）。初始化向导、冲突 resolve、性能基准和实验版发布仍待办。详细进度见 [docs/PROGRESS.md](./docs/PROGRESS.md)，完整范围和安全模型见 [DESIGN.md](./DESIGN.md)。
+> 当前状态：**M0-M2 已完成，M3 核心 reapply 与冲突 resolve 闭环已跑通**。初始化向导、性能基准、完整交替 action 链和实验版发布仍待办。详细进度见 [docs/PROGRESS.md](./docs/PROGRESS.md)，完整范围和安全模型见 [DESIGN.md](./DESIGN.md)。
 
 ## 计划中的五分钟上手流程
 
@@ -90,14 +90,44 @@ unredo plan apply --profile local undo-981.json
 
 普通计划默认遇到任意冲突就停止。Unredo 不提供对整份计划无差别生效的 `--force`。
 
-逐项选择 skip、overwrite 或 abort 的 `plan resolve` 仍在开发中。当前遇到冲突时只能保留现场、人工修复冲突后重新 `plan check`，不能通过 `--force` 绕过：
+冲突必须逐项选择 `skip`、`overwrite` 或 `abort`，不能通过 `--force` 绕过。交互模式：
 
 ```bash
 unredo plan resolve undo-981.json \
+  --operator alice \
+  --reason INC-2026-1042 \
   --output undo-981-resolved.json
 ```
 
-resolved plan 会标记为 unsafe，记录父计划、冲突摘要、操作者和原因，并要求单独的风险确认。它可能产生部分补偿或覆盖后续修改，应只在理解影响后使用。
+自动化可以提供逐项 JSON，不能用一个全局 overwrite：
+
+```json
+{
+  "operator": "alice",
+  "reason": "INC-2026-1042",
+  "resolutions": [
+    {"operation_sequence": 1, "decision": "overwrite"},
+    {"operation_sequence": 2, "decision": "skip"}
+  ]
+}
+```
+
+```bash
+unredo plan resolve undo-981.json \
+  --from-json resolutions.json \
+  --output undo-981-resolved.json
+```
+
+resolved plan 会标记为 `unsafe_resolved`，记录父计划、逐项 conflict digest、操作者和原因。overwrite 会把生成时观察到的当前行固化为新 expect；如果数据再次变化，check/apply 会重新冲突。执行必须同时确认普通 digest 和风险 digest：
+
+```bash
+unredo plan apply undo-981-resolved.json \
+  --non-interactive \
+  --confirm-sha 91c1d203 \
+  --accept-risk 91c1d203 \
+  --operator alice \
+  --reason INC-2026-1042
+```
 
 ## Reapply
 

@@ -142,6 +142,7 @@ func (b *Backend) Check(ctx context.Context, plan ports.Plan) (*ports.CheckResul
 			Column:            c.Column,
 			Expected:          c.Expected,
 			Actual:            c.Actual,
+			Current:           c.Current,
 			Message:           c.Message,
 		})
 	}
@@ -156,7 +157,7 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 	if plan.Ref.Backend != "mysql" {
 		return ports.ExecutionResult{}, fmt.Errorf("mysql: plan backend is %q: %w", plan.Ref.Backend, ports.ErrUnsupportedCapability)
 	}
-	if plan.ExecutionClass != "safe" {
+	if plan.ExecutionClass != "safe" && plan.ExecutionClass != "unsafe_resolved" {
 		return ports.ExecutionResult{}, fmt.Errorf("mysql: execution class %q is not implemented: %w", plan.ExecutionClass, ports.ErrUnsupportedCapability)
 	}
 	if err := b.validateActionChain(ctx, plan); err != nil {
@@ -188,8 +189,14 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 
 func (b *Backend) validateActionChain(ctx context.Context, plan ports.Plan) error {
 	if plan.ParentActionID == "" {
-		if plan.ChainDepth != 0 || plan.RootPlanDigest != "" {
+		if plan.ChainDepth != 0 {
 			return fmt.Errorf("mysql: root plan has inconsistent action-chain metadata")
+		}
+		if plan.ExecutionClass == "safe" && (plan.RootPlanDigest != "" || plan.ParentPlanDigest != "") {
+			return fmt.Errorf("mysql: safe root plan has unexpected parent metadata")
+		}
+		if plan.ExecutionClass == "unsafe_resolved" && (plan.RootPlanDigest == "" || plan.ParentPlanDigest == "") {
+			return fmt.Errorf("mysql: resolved root plan is missing parent/root digest")
 		}
 		return nil
 	}

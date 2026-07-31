@@ -78,6 +78,7 @@ type Conflict struct {
 	Actual            core.Value    `json:"actual,omitempty"`
 	ExpectedDigest    string        `json:"expected_digest,omitempty"`
 	ActualDigest      string        `json:"actual_digest,omitempty"`
+	Current           core.Row      `json:"current,omitempty"`
 	Message           string        `json:"message"`
 }
 
@@ -110,6 +111,7 @@ type Plan struct {
 	RootPlanDigest     string              `json:"root_plan_digest,omitempty"`
 	ParentActionID     string              `json:"parent_action_id,omitempty"`
 	ChainDepth         uint32              `json:"chain_depth,omitempty"`
+	ParentPlanDigest   string              `json:"parent_plan_digest,omitempty"`
 }
 
 // PlanOperation is one row-level step the executor will perform.

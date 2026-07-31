@@ -433,6 +433,99 @@ func TestEndToEndRevertThenReapply(t *testing.T) {
 	)
 }
 
+func TestEndToEndResolveOverwriteRequiresRiskConfirmation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	marker := fmt.Sprintf("resolve-%d", time.Now().UnixNano()%100000000)
+	result, err := execConn.Exec(
+		"INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (?, ?, ?)",
+		993001, marker, "10.00",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowID, _ := result.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE id = ?", rowID) })
+
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status = 'changed', amount = '20.00' WHERE id = ?", rowID); err != nil {
+		t.Fatal(err)
+	}
+	gtid, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentPath := createPlanForGTID(t, rootConn, gtid)
+	parent, err := planner.ReadFile(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status = 'external' WHERE id = ?", rowID); err != nil {
+		t.Fatal(err)
+	}
+	planCheck(t, parentPath, "CONFLICT")
+
+	resolutionPath := filepath.Join(t.TempDir(), "resolutions.json")
+	resolutionJSON := []byte(`{"operator":"incident-dba","reason":"INC-RESOLVE-1","resolutions":[{"operation_sequence":1,"decision":"overwrite"}]}`)
+	if err := os.WriteFile(resolutionPath, resolutionJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolvedPath := filepath.Join(t.TempDir(), "resolved.json")
+	runCLI(t, true,
+		"plan", "resolve", parentPath,
+		"--from-json", resolutionPath,
+		"--output", resolvedPath,
+	)
+	resolved, err := planner.ReadFile(resolvedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ExecutionClass != planner.ClassUnsafeResolved || resolved.ParentPlanDigest != parent.Digest || len(resolved.Resolutions) != 1 {
+		t.Fatalf("unexpected resolved plan metadata: %+v", resolved)
+	}
+	planCheck(t, resolvedPath, "READY")
+
+	// The overwrite is bound to status=external. A second drift invalidates it.
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status = 'drifted' WHERE id = ?", rowID); err != nil {
+		t.Fatal(err)
+	}
+	planCheck(t, resolvedPath, "CONFLICT")
+	if _, err := execConn.Exec("UPDATE unredo_shop.orders SET status = 'external' WHERE id = ?", rowID); err != nil {
+		t.Fatal(err)
+	}
+
+	short := planner.ShortDigest(resolved.Digest)
+	runCLI(t, false,
+		"plan", "apply", resolvedPath,
+		"--non-interactive", "--confirm-sha", short,
+		"--operator", "incident-dba",
+	)
+	applyOutput := runCLI(t, true,
+		"plan", "apply", resolvedPath,
+		"--non-interactive", "--confirm-sha", short,
+		"--accept-risk", short,
+		"--operator", "incident-dba", "--reason", "INC-RESOLVE-1",
+	)
+	action := actionShow(t, outputField(t, applyOutput, "action_id"))
+	if action.ExecutionClass != "UNSAFE_RESOLVED" || action.RootPlanDigest != parent.Digest || action.PlanDigest != resolved.Digest {
+		t.Fatalf("unexpected resolved action marker: %+v", action)
+	}
+	var status, amount string
+	if err := execConn.QueryRow("SELECT status, amount FROM unredo_shop.orders WHERE id = ?", rowID).Scan(&status, &amount); err != nil {
+		t.Fatal(err)
+	}
+	if status != marker || amount != "10.00" {
+		t.Fatalf("resolved overwrite restored status=%q amount=%q; want %q, 10.00", status, amount, marker)
+	}
+}
+
 func createPlanForGTID(t *testing.T, rootConn *sql.DB, gtid string) string {
 	t.Helper()
 	binlogFile, err := readCurrentBinlogFile(rootConn)
@@ -549,6 +642,7 @@ func actionShow(t *testing.T, actionID string) struct {
 	TargetState    string    `json:"target_state"`
 	ChainDepth     uint32    `json:"chain_depth"`
 	CreatedAt      time.Time `json:"created_at"`
+	ExecutionClass string    `json:"execution_class"`
 } {
 	t.Helper()
 	out := runCLI(t, true, "--format", "json", "action", "show", "--action-id", actionID)
@@ -561,6 +655,7 @@ func actionShow(t *testing.T, actionID string) struct {
 		TargetState    string    `json:"target_state"`
 		ChainDepth     uint32    `json:"chain_depth"`
 		CreatedAt      time.Time `json:"created_at"`
+		ExecutionClass string    `json:"execution_class"`
 	}
 	if err := json.Unmarshal([]byte(out), &action); err != nil {
 		t.Fatalf("decode action show: %v\n%s", err, out)

@@ -71,6 +71,7 @@ type Conflict struct {
 	Column            string        `json:"column,omitempty"`
 	Expected          core.Value    `json:"expected,omitempty"`
 	Actual            core.Value    `json:"actual,omitempty"`
+	Current           core.Row      `json:"current,omitempty"`
 	Message           string        `json:"message"`
 }
 
@@ -209,6 +210,7 @@ func checkOneOperation(ctx context.Context, op ports.PlanOperation, reader Reade
 				OperationSequence: op.Sequence,
 				Table:             op.Table,
 				Kind:              ConflictRowExists,
+				Current:           executorRowToCore(row),
 				Message:           "insert plan, but a row with the same key already exists",
 			}}
 		}
@@ -241,6 +243,7 @@ func checkOneOperation(ctx context.Context, op ports.PlanOperation, reader Reade
 // compareRow returns a conflict for each column where current != expect.
 func compareRow(seq int, table core.TableRef, expect core.Row, current Row) []Conflict {
 	var out []Conflict
+	currentRow := executorRowToCore(current)
 	for i, col := range expect.Columns {
 		want := expect.Values[i]
 		got, ok := current.Get(col)
@@ -252,6 +255,7 @@ func compareRow(seq int, table core.TableRef, expect core.Row, current Row) []Co
 				Column:            col,
 				Expected:          want,
 				Actual:            core.Value{Kind: want.Kind, Null: true},
+				Current:           currentRow,
 				Message:           "column not present in current row",
 			})
 			continue
@@ -264,11 +268,19 @@ func compareRow(seq int, table core.TableRef, expect core.Row, current Row) []Co
 				Column:            col,
 				Expected:          want,
 				Actual:            got,
+				Current:           currentRow,
 				Message:           fmt.Sprintf("current value does not match plan expect image (want=%s got=%s)", string(want.Data), string(got.Data)),
 			})
 		}
 	}
 	return out
+}
+
+func executorRowToCore(row Row) core.Row {
+	return core.Row{
+		Columns: append([]string(nil), row.Columns...),
+		Values:  append([]core.Value(nil), row.Values...),
+	}
 }
 
 // valuesEqual compares the canonical typed form without lossy numeric

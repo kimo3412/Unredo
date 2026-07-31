@@ -59,6 +59,10 @@ type Plan struct {
 	RootPlanDigest     string                     `json:"root_plan_digest,omitempty"`
 	ParentActionID     string                     `json:"parent_action_id,omitempty"`
 	ChainDepth         uint32                     `json:"chain_depth,omitempty"`
+	ParentPlanDigest   string                     `json:"parent_plan_digest,omitempty"`
+	ResolutionReason   string                     `json:"resolution_reason,omitempty"`
+	ResolutionOperator string                     `json:"resolution_operator,omitempty"`
+	Resolutions        []Resolution               `json:"resolutions,omitempty"`
 	Digest             string                     `json:"digest"`
 }
 
@@ -511,6 +515,7 @@ func (p *Plan) ToPorts() *ports.Plan {
 		RootPlanDigest:     p.RootPlanDigest,
 		ParentActionID:     p.ParentActionID,
 		ChainDepth:         p.ChainDepth,
+		ParentPlanDigest:   p.ParentPlanDigest,
 	}
 	return out
 }

@@ -335,6 +335,8 @@ unredo plan resolve undo-981.json \
 
 默认进入交互模式，逐项展示冲突及脱敏 diff。非交互模式必须提供结构化 resolution 文件，不能用一个全局 flag 将所有冲突批量 overwrite。
 
+截至 2026-07-31，该流程已经实现。overwrite 不会在 apply 时关闭值比较，而是在生成 resolved plan 时把当时读取到的完整当前行写成新的 expect；因此 conflict digest、计划 digest 和条件写入共同约束观察时刻，任何二次漂移都会重新报冲突。`row_missing` UPDATE 可显式转换为 INSERT，`row_exists` INSERT 可显式转换为绑定当前 image 的 UPDATE，目标状态已经达成的 DELETE/INSERT overwrite 会成为审计记录下的 no-op。
+
 执行 resolved plan：
 
 ```bash
@@ -412,9 +414,10 @@ resolved plan 在通用字段之外还包含：
   "execution_class": "unsafe_resolved",
   "parent_plan_digest": "sha256:...",
   "resolution_reason": "incident INC-2026-1042",
+  "resolution_operator": "alice",
   "resolutions": [
     {
-      "operation_id": "op-17",
+      "operation_sequence": 17,
       "decision": "skip",
       "conflict_digest": "sha256:..."
     }

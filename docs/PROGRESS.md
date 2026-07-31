@@ -1,15 +1,17 @@
 # Unredo 进度报告
 
-> 状态：M2 完成；M3 核心 reapply 闭环完成，发布工程待办。
+> 状态：M2 完成；M3 核心 reapply 与 plan resolve 闭环完成，发布工程待办。
 > 最后更新:2026-07-31
 
 > 2026-07-31 安全加固：apply 现在会针对真实 target 重新检查实例、schema 和 row image；DELETE 使用完整 expect 条件；修复 JSON 字符串、DECIMAL、时间、BLOB、BIT 和 NULL 写回；非交互 apply 强制要求 digest；commit 错误返回 `ErrCommitUnknown`；不再从 `@@global.gtid_executed` 猜测补偿 GTID。新增 UPDATE、DELETE 恢复、BLOB/NULL 和多行冲突零写入的真实 MySQL 集成测试。
 
 > 2026-07-31 M3 核心：实现 `action show`、从根 revert plan 安全生成 `action reapply`、标准 ULID 二进制编码、root/parent/depth 单线链校验。真实 MySQL 已跑通 INSERT → revert → action show → reapply plan check/apply → 原始状态恢复。
 
+> 2026-07-31 冲突逃生通道：实现交互式和 JSON 驱动的 `plan resolve`，支持逐 operation 的 skip/overwrite/abort、conflict digest、父计划审计和 `unsafe_resolved` 双重风险确认。真实 MySQL 已验证二次漂移重新冲突及 overwrite 恢复。
+
 ## 1. TL;DR
 
-Unredo 计划成为 MySQL 事务补偿 CLI。本仓库目前已经实现 M0（技术验证）、M1（只读计划）、M2（安全执行）以及 M3 的核心 reapply 流程。revert 和首次 reapply 都已用真实 MySQL 端到端验证。
+Unredo 计划成为 MySQL 事务补偿 CLI。本仓库目前已经实现 M0（技术验证）、M1（只读计划）、M2（安全执行），以及 M3 的核心 reapply 和冲突 resolve 流程。revert、首次 reapply、unsafe resolved overwrite 都已用真实 MySQL 端到端验证。
 
 | 阶段 | 完成标准 | 状态 |
 |---|---|---|
@@ -61,6 +63,15 @@ $env:UNREDO_EXECUTOR_PASSWORD = 'unredo_executor_pw'
 .\bin\unredo.exe --config unredo.yaml --profile local plan check reapply.json
 .\bin\unredo.exe --config unredo.yaml --profile local plan apply reapply.json `
     --non-interactive --confirm-sha deadbeef --operator alice
+
+# 10. 对冲突逐项生成 unsafe resolved plan
+.\bin\unredo.exe --config unredo.yaml --profile local plan resolve plan.json `
+    --from-json resolutions.json --output resolved.json
+
+# 11. unsafe plan 必须双重确认同一份新计划的 digest
+.\bin\unredo.exe --config unredo.yaml --profile local plan apply resolved.json `
+    --non-interactive --confirm-sha deadbeef --accept-risk deadbeef `
+    --operator alice --reason INC-2026-1042
 ```
 
 `plan check` 状态:`READY` / `CONFLICT` / `STALE_SCHEMA` / `SOURCE_MISMATCH`。
@@ -95,6 +106,7 @@ internal/
   planner/                         # 计划生成 + 序列化(DB-agnostic)
     planner.go                       # Build (revert/reapply), unique-key
                                      # selection, canonical JSON, digest
+    resolve.go                       # conflict digest + resolved plan 构造
     io.go                            # WriteFile / ReadFile / ShortDigest
   backends/mysql/                  # MySQL 8 ROW/FULL/GTID adapter
     backend.go                       # registry init、Check/Apply、action 链校验
@@ -210,6 +222,18 @@ MySQL 1062 → `ErrApplyReplayed`,0 affected → `ErrApplyConflict`,都带上下
 
 生成的 plan 反转根 revert operations 的执行顺序和方向；主键发生变化的 UPDATE 会用 revert 后的主键定位。apply 时 MySQL backend 再校验 parent/root/depth，`uq_root_depth` 阻止并发成功分叉。当前 CLI 只开放根 revert 后的首次 reapply；后续若增加 chained revert，仍复用相同的单线状态机和深度上限。
 
+### 4.8 Conflict resolution
+
+`plan resolve` 总是先对真实 target 重新执行 check，只接受 `CONFLICT`，不允许解决 `STALE_SCHEMA` 或 `SOURCE_MISMATCH`。每个冲突 operation 必须且只能给一个 skip/overwrite/abort 决策；结构化输入中的 conflict digest 可选，但输出计划一定记录按本次实际观察计算的 digest。
+
+- skip：从新计划移除 operation；
+- overwrite：把完整 current row 固化为 expect，再使用正常条件 DML；
+- abort：不生成计划；
+- row missing UPDATE 可转为 INSERT，row exists INSERT 可转为 UPDATE；
+- resolved plan 使用新 plan ID/digest，记录 parent digest、resolver、reason 和逐项决策。
+
+后端不提供“忽略 expect”的执行模式。resolved plan 仍走实例、schema、row check、锁、affected rows 和单事务 marker 路径，执行类别记录为 `UNSAFE_RESOLVED`。
+
 ## 5. 测试覆盖
 
 ### 5.1 单元测试
@@ -219,7 +243,7 @@ MySQL 1062 → `ErrApplyReplayed`,0 affected → `ErrApplyConflict`,都带上下
 | `internal/core` | `value_test.go` | Value.Equal/Validate, OperationKind.Valid, Capabilities.All |
 | `internal/executor` | `check_test.go` | READY / CONFLICT / row_missing / STALE_SCHEMA / SOURCE_MISMATCH / fp error |
 | `internal/executor` | `apply_test.go` | ApplyOptions.Validate 7 个分支,ApplyRequest 类型守门 |
-| `internal/planner` | `planner_test.go` | revert、reapply 反转、PK-changing UPDATE、链元数据、digest、round-trip、唯一键 |
+| `internal/planner` | `planner_test.go` / `resolve_test.go` | revert/reapply、PK-changing UPDATE、resolved skip/overwrite/转换、stale conflict digest |
 | `internal/backends/mysql` | `check_test.go` / `ulidbin_test.go` | driver 解码、DSN 时区、标准 ULID 16-byte round-trip |
 
 跑法:
@@ -242,6 +266,7 @@ make test-integration
 - 多行事务中一行冲突时整笔零写入；
 - INSERT → revert → action show → reapply create/check/apply → 原始行恢复，并核对 parent/root/depth/state；
 - REAPPLY action 不能再次传给 `action reapply`。
+- UPDATE conflict → resolved overwrite → 二次漂移重新 CONFLICT → 双重风险确认 apply → `UNSAFE_RESOLVED` marker。
 
 ### 5.3 测试基础设施约定
 
@@ -268,7 +293,6 @@ make test-integration
 
 - **`unredo_meta.action_markers` 不在 M0 自动 init**:要走 `scripts/init_m0_schema.sql` 或 `migrations/mysql/001_init.sql` 手工建。`unredo init` 命令也是 M1。
 - **`init` 子命令是 stub**:`unredo init` 只打印提示。
-- **`plan resolve` 子命令是 stub**:M2 的"逐项 skip/overwrite"流程未做。
 - **交替 action 链尚未完整开放**：当前支持根 revert 后的首次 reapply；再次 chained revert 的 CLI 入口尚未实现。
 
 ### 7.2 安全模型边界
@@ -296,24 +320,19 @@ M0+M1 覆盖:`bigint` / `int unsigned` / `decimal` / `varchar` / `text` / `times
 
 按 ROI 排序:
 
-1. **`plan resolve` 框架**(0.5-1 天)
-   - 读 plan + CONFLICT,生成 `unsafe_resolved` plan
-   - 交互式 / `--from-json` 两种入口
-   - resolved plan 必须带 `parent_plan_digest` + `resolutions[]`
-
-2. **`unredo init` 交互向导**(1 天)
+1. **`unredo init` 交互向导**(1 天)
    - 生成 profile、随机 server_id、权限 SQL 和 migration 提示
    - 默认不保存管理密码，不静默修改服务端配置
 
-3. **大事务阈值基准**(0.5 天)
+2. **大事务阈值基准**(0.5 天)
    - 写脚本灌 N=10k/100k/1M 行,记录解码耗时、内存峰值、JSON 大小
    - 用测量值替换 `DefaultPolicy` 的占位
 
-4. **完整交替链与提交未知核验**(1 天)
+3. **完整交替链与提交未知核验**(1 天)
    - 从最新 REAPPLY 生成 chained revert，并复用 root/parent/depth 状态机
    - 为 `ErrCommitUnknown` 增加按 action ID 核验入口
 
-5. **发布工程与安装说明**(半天)
+4. **发布工程与安装说明**(半天)
    - 当前 README 是 DESIGN 摘要
    - 加安装(从源码 `go install` / 跨平台构建)、快速上手、最小权限 SQL 模板
 
