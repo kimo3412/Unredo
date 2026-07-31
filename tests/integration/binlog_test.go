@@ -338,6 +338,101 @@ func TestApplyConflictLeavesAllRowsUntouched(t *testing.T) {
 	}
 }
 
+func TestEndToEndRevertThenReapply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	marker := fmt.Sprintf("redo-%d", time.Now().UnixNano()%100000000)
+	result, err := execConn.Exec(
+		"INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (?, ?, ?)",
+		992001, marker, "42.50",
+	)
+	if err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	rowID, _ := result.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE id = ?", rowID) })
+
+	gtid, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPlanPath := createPlanForGTID(t, rootConn, gtid)
+	rootPlan, err := planner.ReadFile(rootPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revertOutput := planApplyCapture(t, rootPlanPath, planner.ShortDigest(rootPlan.Digest), true)
+	revertActionID := outputField(t, revertOutput, "action_id")
+
+	var count int
+	if err := execConn.QueryRow("SELECT COUNT(*) FROM unredo_shop.orders WHERE id = ?", rowID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("revert left row %d present", rowID)
+	}
+	revertAction := actionShow(t, revertActionID)
+	if revertAction.ActionType != "REVERT" || revertAction.TargetState != "ORIGINAL_REVERTED" || revertAction.ChainDepth != 0 {
+		t.Fatalf("unexpected revert marker: %+v", revertAction)
+	}
+	if revertAction.CreatedAt.IsZero() || revertAction.CreatedAt.Location() != time.UTC {
+		t.Fatalf("action timestamp must be a non-zero UTC instant: %s", revertAction.CreatedAt)
+	}
+	if revertAction.RootPlanDigest != rootPlan.Digest || revertAction.PlanDigest != rootPlan.Digest {
+		t.Fatalf("revert marker digest mismatch: %+v", revertAction)
+	}
+
+	reapplyPath := filepath.Join(t.TempDir(), "reapply.json")
+	runCLI(t, true,
+		"action", "reapply",
+		"--action-id", revertActionID,
+		"--root-plan", rootPlanPath,
+		"--output", reapplyPath,
+	)
+	reapplyPlan, err := planner.ReadFile(reapplyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reapplyPlan.RootPlanDigest != rootPlan.Digest || reapplyPlan.ParentActionID != revertActionID || reapplyPlan.ChainDepth != 1 {
+		t.Fatalf("unexpected reapply plan chain: %+v", reapplyPlan)
+	}
+	planCheck(t, reapplyPath, "READY")
+	reapplyOutput := planApplyCapture(t, reapplyPath, planner.ShortDigest(reapplyPlan.Digest), true)
+	reapplyActionID := outputField(t, reapplyOutput, "action_id")
+
+	var gotMarker, gotAmount string
+	if err := execConn.QueryRow("SELECT status, amount FROM unredo_shop.orders WHERE id = ?", rowID).Scan(&gotMarker, &gotAmount); err != nil {
+		t.Fatalf("read reapplied row: %v", err)
+	}
+	if gotMarker != marker || gotAmount != "42.50" {
+		t.Fatalf("reapply restored status=%q amount=%q", gotMarker, gotAmount)
+	}
+	reapplyAction := actionShow(t, reapplyActionID)
+	if reapplyAction.ActionType != "REAPPLY" || reapplyAction.TargetState != "ORIGINAL_APPLIED" || reapplyAction.ChainDepth != 1 {
+		t.Fatalf("unexpected reapply marker: %+v", reapplyAction)
+	}
+	if reapplyAction.ParentActionID != revertActionID || reapplyAction.RootPlanDigest != rootPlan.Digest || reapplyAction.PlanDigest != reapplyPlan.Digest {
+		t.Fatalf("reapply marker chain mismatch: %+v", reapplyAction)
+	}
+
+	// A reapply action is a terminal state for this command: it cannot be
+	// fed back into action reapply to create an unbounded same-direction chain.
+	runCLI(t, false,
+		"action", "reapply",
+		"--action-id", reapplyActionID,
+		"--root-plan", rootPlanPath,
+		"--output", filepath.Join(t.TempDir(), "must-not-exist.json"),
+	)
+}
+
 func createPlanForGTID(t *testing.T, rootConn *sql.DB, gtid string) string {
 	t.Helper()
 	binlogFile, err := readCurrentBinlogFile(rootConn)
@@ -392,6 +487,12 @@ func ensureFullRowMetadata(t *testing.T, db *sql.DB) {
 // (on the second call) replay protection.
 func planApply(t *testing.T, planPath, confirm string, expectedExit int, expectedExitZero bool) {
 	t.Helper()
+	_ = planApplyCapture(t, planPath, confirm, expectedExitZero)
+	_ = expectedExit
+}
+
+func planApplyCapture(t *testing.T, planPath, confirm string, expectedExitZero bool) string {
+	t.Helper()
 	repoRoot := repoRoot(t)
 	binary := filepath.Join(repoRoot, "bin", "unredo.exe")
 	cmd := exec.Command(binary,
@@ -416,7 +517,70 @@ func planApply(t *testing.T, planPath, confirm string, expectedExit int, expecte
 	if !expectedExitZero && exitOK {
 		t.Fatalf("expected apply to fail; got success\n%s", out)
 	}
-	_ = expectedExit
+	return string(out)
+}
+
+func runCLI(t *testing.T, expectSuccess bool, args ...string) string {
+	t.Helper()
+	repoRoot := repoRoot(t)
+	base := []string{"--config", "unredo.yaml", "--profile", "local"}
+	cmd := exec.Command(filepath.Join(repoRoot, "bin", "unredo.exe"), append(base, args...)...)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"UNREDO_READER_PASSWORD="+readerPass,
+		"UNREDO_EXECUTOR_PASSWORD="+executorPass,
+	)
+	out, err := cmd.CombinedOutput()
+	if expectSuccess && err != nil {
+		t.Fatalf("unredo %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	if !expectSuccess && err == nil {
+		t.Fatalf("unredo %s unexpectedly succeeded\n%s", strings.Join(args, " "), out)
+	}
+	return string(out)
+}
+
+func actionShow(t *testing.T, actionID string) struct {
+	ActionID       string    `json:"action_id"`
+	ParentActionID string    `json:"parent_action_id"`
+	RootPlanDigest string    `json:"root_plan_digest"`
+	PlanDigest     string    `json:"plan_digest"`
+	ActionType     string    `json:"action_type"`
+	TargetState    string    `json:"target_state"`
+	ChainDepth     uint32    `json:"chain_depth"`
+	CreatedAt      time.Time `json:"created_at"`
+} {
+	t.Helper()
+	out := runCLI(t, true, "--format", "json", "action", "show", "--action-id", actionID)
+	var action struct {
+		ActionID       string    `json:"action_id"`
+		ParentActionID string    `json:"parent_action_id"`
+		RootPlanDigest string    `json:"root_plan_digest"`
+		PlanDigest     string    `json:"plan_digest"`
+		ActionType     string    `json:"action_type"`
+		TargetState    string    `json:"target_state"`
+		ChainDepth     uint32    `json:"chain_depth"`
+		CreatedAt      time.Time `json:"created_at"`
+	}
+	if err := json.Unmarshal([]byte(out), &action); err != nil {
+		t.Fatalf("decode action show: %v\n%s", err, out)
+	}
+	if action.ActionID != actionID {
+		t.Fatalf("action show returned %q, want %q", action.ActionID, actionID)
+	}
+	return action
+}
+
+func outputField(t *testing.T, output, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == name {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	t.Fatalf("output field %q missing from:\n%s", name, output)
+	return ""
 }
 
 // planCheck runs the CLI's plan check command and asserts the status

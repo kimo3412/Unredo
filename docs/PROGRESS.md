@@ -1,20 +1,22 @@
 # Unredo 进度报告
 
-> 状态:M2 完成,核心 revert 闭环跑通;M3 (reapply) 与发布待办。
+> 状态：M2 完成；M3 核心 reapply 闭环完成，发布工程待办。
 > 最后更新:2026-07-31
 
 > 2026-07-31 安全加固：apply 现在会针对真实 target 重新检查实例、schema 和 row image；DELETE 使用完整 expect 条件；修复 JSON 字符串、DECIMAL、时间、BLOB、BIT 和 NULL 写回；非交互 apply 强制要求 digest；commit 错误返回 `ErrCommitUnknown`；不再从 `@@global.gtid_executed` 猜测补偿 GTID。新增 UPDATE、DELETE 恢复、BLOB/NULL 和多行冲突零写入的真实 MySQL 集成测试。
 
+> 2026-07-31 M3 核心：实现 `action show`、从根 revert plan 安全生成 `action reapply`、标准 ULID 二进制编码、root/parent/depth 单线链校验。真实 MySQL 已跑通 INSERT → revert → action show → reapply plan check/apply → 原始状态恢复。
+
 ## 1. TL;DR
 
-Unredo 计划成为 MySQL 事务补偿 CLI。本仓库目前已经实现 M0(技术验证)、M1(只读计划)、M2(安全执行)三个里程碑。从一行 INSERT 到 revert 回滚,**端到端用真 MySQL 跑过**,集成测试一发过(0.5s 左右)。
+Unredo 计划成为 MySQL 事务补偿 CLI。本仓库目前已经实现 M0（技术验证）、M1（只读计划）、M2（安全执行）以及 M3 的核心 reapply 流程。revert 和首次 reapply 都已用真实 MySQL 端到端验证。
 
 | 阶段 | 完成标准 | 状态 |
 |---|---|---|
 | M0 | 给定 fixture GTID,能输出与 SQL 结果一致的 before/after image | ✅ |
 | M1 | 支持范围内的事务都能生成确定性 plan,但工具没有执行能力 | ✅ |
 | M2 | 集成测试证明冲突时零部分写入,同一 plan 不能重复应用 | ✅ |
-| M3 | reapply 审计关系完整,发布实验版本 | ⏳ |
+| M3 | reapply 审计关系完整,发布实验版本 | 核心完成，发布待办 |
 
 ## 2. 已经能跑的命令
 
@@ -46,6 +48,19 @@ $env:UNREDO_EXECUTOR_PASSWORD = 'unredo_executor_pw'
 # 6. 真正执行(写目标库 + 写 action marker)
 .\bin\unredo.exe --config unredo.yaml --profile local plan apply plan.json `
     --non-interactive --confirm-sha 493c1e59 --operator alice
+
+# 7. 查看成功 action
+.\bin\unredo.exe --config unredo.yaml --profile local action show `
+    --action-id 01K...
+
+# 8. 从最新成功 revert 和根 plan 生成 reapply plan
+.\bin\unredo.exe --config unredo.yaml --profile local action reapply `
+    --action-id 01K... --root-plan plan.json --output reapply.json
+
+# 9. reapply 仍需独立检查和确认执行
+.\bin\unredo.exe --config unredo.yaml --profile local plan check reapply.json
+.\bin\unredo.exe --config unredo.yaml --profile local plan apply reapply.json `
+    --non-interactive --confirm-sha deadbeef --operator alice
 ```
 
 `plan check` 状态:`READY` / `CONFLICT` / `STALE_SCHEMA` / `SOURCE_MISMATCH`。
@@ -61,7 +76,7 @@ internal/
     doctor.go                        # 包装 backend.RunDoctor
     txn.go                           # txn list + txn show
     plan.go                          # plan create / check / apply / resolve
-    action.go                        # action show / reapply (M3 stub)
+    action.go                        # action show / reapply
     init.go                          # M1 init 向导 stub
   config/                          # YAML profile + 密码环境变量
   core/                            # DB-agnostic 类型
@@ -82,8 +97,8 @@ internal/
                                      # selection, canonical JSON, digest
     io.go                            # WriteFile / ReadFile / ShortDigest
   backends/mysql/                  # MySQL 8 ROW/FULL/GTID adapter
-    backend.go                       # registry init,Backend struct,
-                                     # Check/Apply wiring
+    backend.go                       # registry init、Check/Apply、action 链校验
+    action_store.go                  # action marker 查询
     source/                          # binlog replication 读取
     schema/                          # information_schema 读取 + sha256 fp
     value/                           # 类型解码(integer/decimal/text/.../bit/enum)
@@ -139,6 +154,7 @@ MySQL 驱动给的 `[]byte` 在解码器里统一先 `asString`,再 `json.Marsha
 - `source.{backend, instance_id, native_transaction_id, cursor}`
 - `schema_fingerprints` 每张表 sha256
 - `operations[]` 每条含 `key` / `expect` / `write`
+- reapply 子计划额外含 `root_plan_digest` / `parent_action_id` / `chain_depth`
 - `digest` sha256 over canonical JSON,排除自身字段
 
 `WriteFile` 用 canonical-JSON 重排键后再缩进美化,`ReadFile` 重算 digest 校验。`ShortDigest` 返回 hex 前 8 位,匹配 `--confirm-sha` 和 `--accept-risk`。
@@ -180,6 +196,20 @@ MySQL 1062 → `ErrApplyReplayed`,0 affected → `ErrApplyConflict`,都带上下
 
 当前 DSN 故意**不**设置 `time_zone='+00:00'`,让 read/write 走同一个 `+08:00`。代价:跨时区 instance 的 plan 不能直接用 — M2 trust model 是 writer/reader 同实例、同默认时区。
 
+### 4.7 Reapply action 链
+
+`action show` 从 `unredo_meta.action_markers` 读取成功提交的 action；时间通过 Unix 微秒读取并输出为 UTC，避免把 MySQL 会话时区误标成主机时区。
+
+`action reapply` 要求同时提供 action ID 和原始根 revert plan。生成前会验证：
+
+- 根 plan digest 自校验通过，且是 `safe/revert`；
+- action 是该根摘要的最新成功 action；
+- action 状态是 `REVERT/ORIGINAL_REVERTED`；
+- action 的 plan/root digest 都与根 plan 一致；
+- 下一层深度不超过 `max_action_depth`。
+
+生成的 plan 反转根 revert operations 的执行顺序和方向；主键发生变化的 UPDATE 会用 revert 后的主键定位。apply 时 MySQL backend 再校验 parent/root/depth，`uq_root_depth` 阻止并发成功分叉。当前 CLI 只开放根 revert 后的首次 reapply；后续若增加 chained revert，仍复用相同的单线状态机和深度上限。
+
 ## 5. 测试覆盖
 
 ### 5.1 单元测试
@@ -189,8 +219,8 @@ MySQL 1062 → `ErrApplyReplayed`,0 affected → `ErrApplyConflict`,都带上下
 | `internal/core` | `value_test.go` | Value.Equal/Validate, OperationKind.Valid, Capabilities.All |
 | `internal/executor` | `check_test.go` | READY / CONFLICT / row_missing / STALE_SCHEMA / SOURCE_MISMATCH / fp error |
 | `internal/executor` | `apply_test.go` | ApplyOptions.Validate 7 个分支,ApplyRequest 类型守门 |
-| `internal/planner` | `planner_test.go` | revert INSERT→DELETE、revert UPDATE 逆序、reapply 顺序、digest 排除自身、round-trip 读盘、唯一键选 PRIMARY |
-| `internal/backends/mysql` | `check_test.go` | ReadByKey 直读 driver 解码路径,DSN 时区生效 |
+| `internal/planner` | `planner_test.go` | revert、reapply 反转、PK-changing UPDATE、链元数据、digest、round-trip、唯一键 |
+| `internal/backends/mysql` | `check_test.go` / `ulidbin_test.go` | driver 解码、DSN 时区、标准 ULID 16-byte round-trip |
 
 跑法:
 ```powershell
@@ -205,7 +235,13 @@ go test ./...
 make test-integration
 ```
 
-覆盖链路:INSERT → 读 GTID → `plan create` → `plan check` (READY) → mutate → `plan check` (CONFLICT) → 还原 → `plan check` (READY) → **`plan apply` (1 affected)** → **`plan apply` 第二次被 plan_id UNIQUE 挡**。
+覆盖链路包括：
+
+- INSERT → plan create/check/apply → 同 plan 重放被阻止；
+- UPDATE、DELETE、BLOB、NULL 的真实写回；
+- 多行事务中一行冲突时整笔零写入；
+- INSERT → revert → action show → reapply create/check/apply → 原始行恢复，并核对 parent/root/depth/state；
+- REAPPLY action 不能再次传给 `action reapply`。
 
 ### 5.3 测试基础设施约定
 
@@ -233,7 +269,7 @@ make test-integration
 - **`unredo_meta.action_markers` 不在 M0 自动 init**:要走 `scripts/init_m0_schema.sql` 或 `migrations/mysql/001_init.sql` 手工建。`unredo init` 命令也是 M1。
 - **`init` 子命令是 stub**:`unredo init` 只打印提示。
 - **`plan resolve` 子命令是 stub**:M2 的"逐项 skip/overwrite"流程未做。
-- **`action show` / `action reapply` 是 stub**:M3 范围。
+- **交替 action 链尚未完整开放**：当前支持根 revert 后的首次 reapply；再次 chained revert 的 CLI 入口尚未实现。
 
 ### 7.2 安全模型边界
 
@@ -254,45 +290,34 @@ M0+M1 覆盖:`bigint` / `int unsigned` / `decimal` / `varchar` / `text` / `times
 
 ## 8. 仓库状态
 
-5 个 commit,branch `main`:
-
-```
-856b584 feat(m2): plan apply end-to-end with marker, GTID, and replay protection
-f1c3... feat(m2): plan check end-to-end with conflict and schema-drift detection
-7a8e... feat(m1): planner, plan file format, plan create, integration test
-c4d2... feat(m0): scaffold CLI + MySQL backend, prove binlog read path
-91648f4 docs: add initial DESIGN.md and README.md for Unredo MVP
-```
-
-`go vet ./...` + `go vet -tags=integration ./...` 干净。
+分支 `main`。本轮验证：`go test ./...`、`go vet ./...`、真实 MySQL integration suite 和 `unredo doctor` 均通过。
 
 ## 9. 下一步建议
 
 按 ROI 排序:
 
-1. **multi-op 原子性集成测试**(0.5 天)
-   - 写 INSERT 2 行,中间一行被外部 UPDATE
-   - 期望:apply 报 CONFLICT,marker 也不在,2 行都还在
-   - 这是 DESIGN.md M2 明文验收点,目前靠事务结构保证但没专门测
-
-2. **`action show` + `action reapply` (M3 起步)**(0.5-1 天)
-   - 读 `unredo_meta.action_markers` 渲染 action 摘要
-   - reapply:从 root plan + action marker 推导 reapply plan,走和 revert 一样的 apply 路径,只是 mode=reapply、target_state=ORIGINAL_APPLIED
-
-3. **`plan resolve` 框架**(0.5-1 天)
+1. **`plan resolve` 框架**(0.5-1 天)
    - 读 plan + CONFLICT,生成 `unsafe_resolved` plan
    - 交互式 / `--from-json` 两种入口
    - resolved plan 必须带 `parent_plan_digest` + `resolutions[]`
 
-4. **大事务阈值基准**(0.5 天)
+2. **`unredo init` 交互向导**(1 天)
+   - 生成 profile、随机 server_id、权限 SQL 和 migration 提示
+   - 默认不保存管理密码，不静默修改服务端配置
+
+3. **大事务阈值基准**(0.5 天)
    - 写脚本灌 N=10k/100k/1M 行,记录解码耗时、内存峰值、JSON 大小
    - 用测量值替换 `DefaultPolicy` 的占位
 
-5. **README 收尾 + 安装说明**(半天)
+4. **完整交替链与提交未知核验**(1 天)
+   - 从最新 REAPPLY 生成 chained revert，并复用 root/parent/depth 状态机
+   - 为 `ErrCommitUnknown` 增加按 action ID 核验入口
+
+5. **发布工程与安装说明**(半天)
    - 当前 README 是 DESIGN 摘要
    - 加安装(从源码 `go install` / 跨平台构建)、快速上手、最小权限 SQL 模板
 
-我推荐先做 #1(验收点),再 #2(M3 的核心)。你定。
+建议下一步先实现 `plan resolve` 或 `unredo init`，再做阈值基准和实验版发布。
 
 ## 10. 一些工具和约定备忘
 

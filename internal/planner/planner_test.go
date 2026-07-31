@@ -76,6 +76,73 @@ func TestBuildReapplyForwardOrder(t *testing.T) {
 	}
 }
 
+func TestBuildReapplyInvertsRootRevertAndPreservesChain(t *testing.T) {
+	root := &Plan{
+		FormatVersion:      FormatVersion,
+		PlanID:             "01K1TEST000000000000000001",
+		Mode:               ModeRevert,
+		ExecutionClass:     ClassSafe,
+		ToolVersion:        "test-root",
+		Source:             sampleTxn(t, nil).Ref,
+		SchemaFingerprints: map[string]string{"unredo_shop.orders": "sha256:abc"},
+		Operations: []ports.PlanOperation{
+			{Sequence: 1, Table: sampleOrdersSchema().Table, Kind: core.OpUpdate, Key: idRow(8), Expect: orderWithID(8), Write: orderWithID(7)},
+			{Sequence: 2, Table: sampleOrdersSchema().Table, Kind: core.OpDelete, Key: idRow(9), Expect: orderWithID(9)},
+		},
+	}
+	root.Digest = computeDigest(root)
+
+	child, err := BuildReapply(root, "01K1TEST000000000000000002", 0, "test-child")
+	if err != nil {
+		t.Fatalf("BuildReapply: %v", err)
+	}
+	if child.Mode != ModeReapply || child.RootPlanDigest != root.Digest || child.ChainDepth != 1 {
+		t.Fatalf("unexpected chain metadata: mode=%s root=%s depth=%d", child.Mode, child.RootPlanDigest, child.ChainDepth)
+	}
+	if child.ParentActionID != "01K1TEST000000000000000002" || len(child.Operations) != 2 {
+		t.Fatalf("unexpected parent or operation count")
+	}
+	// Reapply reverses the revert execution order. The root DELETE becomes
+	// an INSERT, followed by the inverse UPDATE.
+	if child.Operations[0].Kind != core.OpInsert || child.Operations[1].Kind != core.OpUpdate {
+		t.Fatalf("unexpected operation order: %s, %s", child.Operations[0].Kind, child.Operations[1].Kind)
+	}
+	if recomputeDigest(t, child) != child.Digest {
+		t.Fatal("child digest is not stable")
+	}
+}
+
+func TestBuildReapplyUsesRevertedPrimaryKeyForPKChangingUpdate(t *testing.T) {
+	root := &Plan{
+		FormatVersion:  FormatVersion,
+		PlanID:         "01K1TEST000000000000000003",
+		Mode:           ModeRevert,
+		ExecutionClass: ClassSafe,
+		Source:         sampleTxn(t, nil).Ref,
+		Operations: []ports.PlanOperation{{
+			Sequence: 1,
+			Table:    sampleOrdersSchema().Table,
+			Kind:     core.OpUpdate,
+			Key:      idRow(8),
+			Expect:   orderWithID(8),
+			Write:    orderWithID(7),
+		}},
+	}
+	root.Digest = computeDigest(root)
+	child, err := BuildReapply(root, "01K1TEST000000000000000004", 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := child.Operations[0]
+	value, ok := op.Key.Get("id")
+	if !ok || !value.Equal(idRow(7).Values[0]) {
+		t.Fatalf("reapply key must address reverted id=7 row, got %+v", op.Key)
+	}
+	if !equalRow(op.Expect, orderWithID(7)) || !equalRow(op.Write, orderWithID(8)) {
+		t.Fatal("reapply UPDATE images were not inverted")
+	}
+}
+
 func TestPlanDigestIsStable(t *testing.T) {
 	txn := sampleTxn(t, []core.RowChange{
 		mkRow(1, core.OpInsert, core.Row{}, sampleOrders()),
@@ -207,6 +274,16 @@ func sampleOrders() core.Row {
 			{Kind: core.KindDecimal, Encoding: "string", Data: jsonRaw("99.00"), Native: ptr("decimal(12,2)")},
 		},
 	}
+}
+
+func orderWithID(id int) core.Row {
+	out := sampleOrders()
+	out.Values[0] = core.Value{Kind: core.KindInteger, Data: jsonRaw(id), Native: ptr("bigint")}
+	return out
+}
+
+func idRow(id int) core.Row {
+	return core.Row{Columns: []string{"id"}, Values: []core.Value{{Kind: core.KindInteger, Data: jsonRaw(id), Native: ptr("bigint")}}}
 }
 
 func withStatus(in core.Row, s string) core.Row {

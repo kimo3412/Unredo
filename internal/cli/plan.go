@@ -349,8 +349,8 @@ func ensureParentDir(path string) error {
 }
 
 func toolVersion() string {
-	// M1: a static version. M3 will read this from build-time -ldflags.
-	return "0.1.0-m1"
+	// Static until release packaging wires a build-time version via ldflags.
+	return "0.1.0-m3"
 }
 
 func printCheckHuman(cmd *cobra.Command, r *ports.CheckResult, showConflicts bool) {

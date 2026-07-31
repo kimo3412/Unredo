@@ -182,7 +182,10 @@ func (w *ApplyWriter) insertMarker(ctx context.Context, conn *sql.Conn, plan *po
 	if err != nil {
 		return fmt.Errorf("mysql apply: plan digest: %w", err)
 	}
-	rootBin := digestBin // for M2 the root digest equals the plan digest
+	rootBin, err := digestBytes(opts.RootPlanDigest)
+	if err != nil {
+		return fmt.Errorf("mysql apply: root plan digest: %w", err)
+	}
 	q := `INSERT INTO unredo_meta.action_markers
 		(action_id, plan_id, parent_action_id, root_plan_digest,
 		 action_type, target_state, chain_depth,
@@ -201,7 +204,7 @@ func (w *ApplyWriter) insertMarker(ctx context.Context, conn *sql.Conn, plan *po
 		digestBin,
 		opts.ExecutionClass,
 		nullString(opts.Reason),
-		"0.1.0-m2",
+		"0.1.0-m3",
 		opts.OperatorName,
 	)
 	if err != nil {

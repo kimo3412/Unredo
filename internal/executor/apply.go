@@ -24,6 +24,8 @@ type ApplyOptions struct {
 	ChainDepth uint32
 	// ParentActionID is nil for the first action.
 	ParentActionID []byte
+	// RootPlanDigest is the immutable root revert plan digest.
+	RootPlanDigest string
 	// OperatorName is recorded in the marker; it is required.
 	OperatorName string
 	// Reason is optional free text (e.g. incident ticket).

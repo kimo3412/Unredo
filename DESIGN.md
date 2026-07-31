@@ -324,6 +324,8 @@ unredo plan apply redo-981.json
 
 reapply 需要根 plan 中保存的完整 before/after image，marker 表只保存身份和 digest，不能替代计划文件。`action reapply` 会校验 root plan digest 与 action marker 是否一致，只生成新计划，不直接执行。如果根 plan 丢失且原 binlog 也已 purge，MVP 无法安全 reapply。
 
+截至 2026-07-31，CLI 已实现根 revert 后的首次 reapply：还会校验所给 action 是该根摘要下最新的成功 `REVERT/ORIGINAL_REVERTED` action，生成带 `root_plan_digest`、`parent_action_id` 和 `chain_depth=1` 的新计划。apply 前 MySQL adapter 会再次核验链关系。当前尚未开放从 REAPPLY 生成 chained revert 的入口，因此实现层面不会形成无限交替；后续开放时仍受 §5.4 状态机和 `max_action_depth` 约束。
+
 ### 6.9 解决冲突
 
 ```bash
@@ -871,7 +873,7 @@ MySQL 是第一套契约实现；未来后端必须新增自己的真实数据�
 
 ### M3：Reapply 与发布
 
-- `action show/reapply`。
+- `action show/reapply`。（核心已实现）
 - 安装包和跨平台构建。
 - 完整权限文档和故障排查。
 - 大事务保护与性能基准。

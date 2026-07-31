@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/girimi/unredo/internal/core"
 )
@@ -20,6 +21,7 @@ var (
 	ErrSchemaMismatch        = errors.New("schema mismatch")
 	ErrPlanDigestMismatch    = errors.New("plan digest mismatch")
 	ErrInstanceMismatch      = errors.New("instance id mismatch")
+	ErrActionNotFound        = errors.New("action not found")
 )
 
 // ScanScope narrows what a Scan call returns. Backend-specific fields
@@ -105,6 +107,9 @@ type Plan struct {
 	Operations         []PlanOperation     `json:"operations"`
 	SchemaFingerprints map[string]string   `json:"schema_fingerprints,omitempty"`
 	Digest             string              `json:"digest,omitempty"`
+	RootPlanDigest     string              `json:"root_plan_digest,omitempty"`
+	ParentActionID     string              `json:"parent_action_id,omitempty"`
+	ChainDepth         uint32              `json:"chain_depth,omitempty"`
 }
 
 // PlanOperation is one row-level step the executor will perform.
@@ -132,6 +137,28 @@ type ApplyRequest struct {
 	OperatorName string
 	Reason       string
 	Confirm      string
+}
+
+type Action struct {
+	ActionID                  string    `json:"action_id"`
+	PlanID                    string    `json:"plan_id"`
+	ParentActionID            string    `json:"parent_action_id,omitempty"`
+	RootPlanDigest            string    `json:"root_plan_digest"`
+	ActionType                string    `json:"action_type"`
+	TargetState               string    `json:"target_state"`
+	ChainDepth                uint32    `json:"chain_depth"`
+	SourceNativeTransactionID string    `json:"source_native_transaction_id"`
+	PlanDigest                string    `json:"plan_digest"`
+	ExecutionClass            string    `json:"execution_class"`
+	Reason                    string    `json:"reason,omitempty"`
+	ToolVersion               string    `json:"tool_version"`
+	OperatorName              string    `json:"operator_name"`
+	CreatedAt                 time.Time `json:"created_at"`
+}
+
+type ActionStore interface {
+	FindAction(ctx context.Context, actionID string) (*Action, error)
+	LatestAction(ctx context.Context, rootPlanDigest string) (*Action, error)
 }
 
 // PlanExecutor checks and applies plans against the target database.

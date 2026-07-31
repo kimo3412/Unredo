@@ -1,9 +1,7 @@
 package mysql
 
 import (
-	"encoding/binary"
 	"fmt"
-	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -17,11 +15,18 @@ func ulidBytes(s string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 16)
-	binary.BigEndian.PutUint64(out, id.Time())
-	entropy := id.Entropy()
-	copy(out[8:], entropy)
+	out := make([]byte, len(id))
+	copy(out, id[:])
 	return out, nil
+}
+
+func ulidString(b []byte) (string, error) {
+	var id ulid.ULID
+	if len(b) != len(id) {
+		return "", fmt.Errorf("ULID binary length is %d, want %d", len(b), len(id))
+	}
+	copy(id[:], b)
+	return id.String(), nil
 }
 
 // newULID returns a fresh ULID as a string. Used when the CLI needs
@@ -29,19 +34,3 @@ func ulidBytes(s string) ([]byte, error) {
 func newULID() string {
 	return ulid.Make().String()
 }
-
-// planIDFromDigest is a stable derivation of plan_id from the digest
-// string. M2 doesn't actually need it (the planner already writes a
-// ULID plan_id into the plan file), but the function lives here for
-// callers that want to synthesise a deterministic id from a digest.
-func planIDFromDigest(digest string) string {
-	t := time.Unix(0, 0)
-	_ = t
-	// Stub: derive a ULID from the digest prefix. Real callers should
-	// use the plan_id from the file; this exists so the function
-	// signature is stable while we iterate.
-	return ""
-}
-
-// silence unused
-var _ = fmt.Sprintf

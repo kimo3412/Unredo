@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**M0-M2 已完成,核心 revert 闭环跑通**(plan create / check / apply + 集成测试 + 重放保护)。M3 (reapply) 与发布待办。详细进度见 [docs/PROGRESS.md](./docs/PROGRESS.md),完整范围和安全模型见 [DESIGN.md](./DESIGN.md)。
+> 当前状态：**M0-M2 已完成，M3 核心 reapply 闭环已跑通**（action show / reapply + action 链校验 + 真实 MySQL 集成测试）。初始化向导、冲突 resolve、性能基准和实验版发布仍待办。详细进度见 [docs/PROGRESS.md](./docs/PROGRESS.md)，完整范围和安全模型见 [DESIGN.md](./DESIGN.md)。
 
 ## 计划中的五分钟上手流程
 
@@ -23,13 +23,18 @@ enforce_gtid_consistency=ON
 
 部分配置需要 DBA 修改 MySQL 配置并重启。Unredo 不会静默修改或重启数据库。
 
-### 2. 运行初始化向导
+### 2. 初始化账号、元数据库与配置
+
+`unredo init` 目前还是占位命令。生产环境应由 DBA 创建 reader/executor 最小权限账号，执行元数据 migration，再参照仓库的 `unredo.yaml` 编写 profile：
 
 ```bash
-unredo init --profile local
+mysql < migrations/mysql/001_init.sql
+# 密码只通过 profile 中 password_env 指向的环境变量提供
 ```
 
-向导将：
+`scripts/setup_test_users.sql` 和 `scripts/init_m0_schema.sql` 会删除并重建测试库，只适用于一次性本地测试环境，不能在生产执行。
+
+后续的 `unredo init --profile local` 向导将：
 
 - 检查 MySQL 版本、ROW/FULL/GTID 和 binlog 保留状态。
 - 为 profile 生成并持久化随机 replication server ID。
@@ -85,7 +90,7 @@ unredo plan apply --profile local undo-981.json
 
 普通计划默认遇到任意冲突就停止。Unredo 不提供对整份计划无差别生效的 `--force`。
 
-需要事故处置时，可以逐项选择 skip、overwrite 或 abort，并生成可审计的 resolved plan：
+逐项选择 skip、overwrite 或 abort 的 `plan resolve` 仍在开发中。当前遇到冲突时只能保留现场、人工修复冲突后重新 `plan check`，不能通过 `--force` 绕过：
 
 ```bash
 unredo plan resolve undo-981.json \
@@ -99,13 +104,18 @@ resolved plan 会标记为 unsafe，记录父计划、冲突摘要、操作者�
 Reapply 需要原始根计划，因为数据库 marker 只保存身份和摘要，不保存可能包含敏感数据的完整 row image：
 
 ```bash
+unredo action show --action-id 01J...
+
 unredo action reapply \
   --action-id 01J... \
   --root-plan undo-981.json \
   --output redo-981.json
+
+unredo plan check redo-981.json
+unredo plan apply redo-981.json
 ```
 
-Revert/reapply 不会自动循环。每一步都必须显式创建、检查和执行新计划。
+`action reapply` 只接受该根计划最新的成功 `REVERT/ORIGINAL_REVERTED` action，并校验 action、根摘要和链深度；它只生成计划，不修改数据库。当前 CLI 支持“根 revert → 首次 reapply”，不支持把 REAPPLY action 再次 reapply。每一步都必须显式创建、检查和执行，`max_action_depth` 为后续交替链设置硬上限。
 
 ## MVP 边界
 

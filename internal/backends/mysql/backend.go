@@ -159,6 +159,9 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 	if plan.ExecutionClass != "safe" {
 		return ports.ExecutionResult{}, fmt.Errorf("mysql: execution class %q is not implemented: %w", plan.ExecutionClass, ports.ErrUnsupportedCapability)
 	}
+	if err := b.validateActionChain(ctx, plan); err != nil {
+		return ports.ExecutionResult{}, err
+	}
 	// Apply must never rely on a check performed by an earlier CLI command.
 	// Re-check the real target instance, schema and current row images now.
 	reader := NewCheckReader(b.targetDSN, b.targetInstanceID)
@@ -181,6 +184,42 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 		return ports.ExecutionResult{}, err
 	}
 	return writer.Apply(ctx, &plan, opts)
+}
+
+func (b *Backend) validateActionChain(ctx context.Context, plan ports.Plan) error {
+	if plan.ParentActionID == "" {
+		if plan.ChainDepth != 0 || plan.RootPlanDigest != "" {
+			return fmt.Errorf("mysql: root plan has inconsistent action-chain metadata")
+		}
+		return nil
+	}
+	if plan.RootPlanDigest == "" || plan.ChainDepth == 0 {
+		return fmt.Errorf("mysql: child plan is missing root digest or chain depth")
+	}
+	if b.policy.MaxActionDepth > 0 && int(plan.ChainDepth) > b.policy.MaxActionDepth {
+		return fmt.Errorf("mysql: action chain depth %d exceeds limit %d", plan.ChainDepth, b.policy.MaxActionDepth)
+	}
+	parent, err := b.FindAction(ctx, plan.ParentActionID)
+	if err != nil {
+		return fmt.Errorf("mysql: parent action: %w", err)
+	}
+	if parent.RootPlanDigest != plan.RootPlanDigest || parent.ChainDepth+1 != plan.ChainDepth {
+		return fmt.Errorf("mysql: parent action does not match root/depth")
+	}
+	latest, err := b.LatestAction(ctx, plan.RootPlanDigest)
+	if err != nil {
+		return fmt.Errorf("mysql: latest action: %w", err)
+	}
+	if latest.ActionID != parent.ActionID {
+		return fmt.Errorf("mysql: parent action is not the latest successful action")
+	}
+	if plan.Mode == "reapply" && parent.TargetState != "ORIGINAL_REVERTED" {
+		return fmt.Errorf("mysql: reapply requires latest state ORIGINAL_REVERTED")
+	}
+	if plan.Mode == "revert" && parent.TargetState != "ORIGINAL_APPLIED" {
+		return fmt.Errorf("mysql: chained revert requires latest state ORIGINAL_APPLIED")
+	}
+	return nil
 }
 
 // buildApplyOptions derives the marker row from a plan and the
@@ -210,14 +249,27 @@ func (b *Backend) buildApplyOptions(plan ports.Plan, req ports.ApplyRequest) (ex
 	if plan.ExecutionClass == "unsafe_resolved" {
 		executionClass = "UNSAFE_RESOLVED"
 	}
-	chainDepth := uint32(0) // M2 has no chain concept; M3 will compute it
+	chainDepth := uint32(0)
+	rootPlanDigest := plan.RootPlanDigest
+	if rootPlanDigest == "" {
+		rootPlanDigest = plan.Digest
+	}
+	var parentActionID []byte
+	if plan.ParentActionID != "" {
+		parentActionID, err = ulidBytes(plan.ParentActionID)
+		if err != nil {
+			return executor.ApplyOptions{}, fmt.Errorf("mysql: parent_action_id %q: %w", plan.ParentActionID, err)
+		}
+	}
+	chainDepth = plan.ChainDepth
 	return executor.ApplyOptions{
 		PlanID:                    planID,
 		ActionID:                  actionIDBytes,
 		ActionType:                actionType,
 		TargetState:               targetState,
 		ChainDepth:                chainDepth,
-		ParentActionID:            nil,
+		ParentActionID:            parentActionID,
+		RootPlanDigest:            rootPlanDigest,
 		OperatorName:              req.OperatorName,
 		Reason:                    req.Reason,
 		ExecutionClass:            executionClass,

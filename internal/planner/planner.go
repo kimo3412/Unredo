@@ -56,6 +56,9 @@ type Plan struct {
 	SchemaFingerprints map[string]string          `json:"schema_fingerprints"`
 	Operations         []ports.PlanOperation      `json:"operations"`
 	BackendExtensions  map[string]json.RawMessage `json:"backend_extensions,omitempty"`
+	RootPlanDigest     string                     `json:"root_plan_digest,omitempty"`
+	ParentActionID     string                     `json:"parent_action_id,omitempty"`
+	ChainDepth         uint32                     `json:"chain_depth,omitempty"`
 	Digest             string                     `json:"digest"`
 }
 
@@ -70,6 +73,102 @@ type Deps struct {
 	// ToolVersion is stamped into the plan so audits know which build
 	// produced it.
 	ToolVersion string
+}
+
+// BuildReapply derives the next safe plan from an applied root revert plan.
+// The caller must validate the parent action against the ActionStore first.
+func BuildReapply(root *Plan, parentActionID string, parentDepth uint32, toolVersion string) (*Plan, error) {
+	if root == nil {
+		return nil, errors.New("planner: nil root plan")
+	}
+	if root.Mode != ModeRevert || root.ExecutionClass != ClassSafe {
+		return nil, fmt.Errorf("planner: reapply requires a safe root revert plan")
+	}
+	if parentActionID == "" {
+		return nil, fmt.Errorf("planner: parent action id is required")
+	}
+	ops := make([]ports.PlanOperation, 0, len(root.Operations))
+	for i := len(root.Operations) - 1; i >= 0; i-- {
+		inverted, err := invertRevertOperation(root.Operations[i])
+		if err != nil {
+			return nil, err
+		}
+		inverted.Sequence = len(ops) + 1
+		ops = append(ops, inverted)
+	}
+	p := &Plan{
+		FormatVersion:      FormatVersion,
+		PlanID:             ulid.Make().String(),
+		Mode:               ModeReapply,
+		ExecutionClass:     ClassSafe,
+		CreatedAt:          time.Now().UTC(),
+		ToolVersion:        toolVersion,
+		Source:             root.Source,
+		SchemaFingerprints: cloneStringMap(root.SchemaFingerprints),
+		Operations:         ops,
+		BackendExtensions:  cloneRawMap(root.BackendExtensions),
+		RootPlanDigest:     root.Digest,
+		ParentActionID:     parentActionID,
+		ChainDepth:         parentDepth + 1,
+	}
+	p.Digest = computeDigest(p)
+	return p, nil
+}
+
+func invertRevertOperation(op ports.PlanOperation) (ports.PlanOperation, error) {
+	out := ports.PlanOperation{Table: op.Table}
+	keyColumns := op.Key.Columns
+	switch op.Kind {
+	case core.OpDelete:
+		out.Kind = core.OpInsert
+		out.Write = op.Expect
+		out.Key = projectColumns(op.Expect, keyColumns)
+	case core.OpInsert:
+		out.Kind = core.OpDelete
+		out.Expect = op.Write
+		out.Key = projectColumns(op.Write, keyColumns)
+	case core.OpUpdate:
+		out.Kind = core.OpUpdate
+		out.Expect = op.Write
+		out.Write = op.Expect
+		out.Key = projectColumns(op.Write, keyColumns)
+	default:
+		return ports.PlanOperation{}, fmt.Errorf("planner: cannot invert operation %q", op.Kind)
+	}
+	if len(out.Key.Columns) != len(keyColumns) {
+		return ports.PlanOperation{}, fmt.Errorf("planner: reapply operation missing key columns %v", keyColumns)
+	}
+	return out, nil
+}
+
+func projectColumns(row core.Row, columns []string) core.Row {
+	out := core.Row{Columns: make([]string, 0, len(columns)), Values: make([]core.Value, 0, len(columns))}
+	for _, column := range columns {
+		if value, ok := row.Get(column); ok {
+			out.Columns = append(out.Columns, column)
+			out.Values = append(out.Values, value)
+		}
+	}
+	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRawMap(in map[string]json.RawMessage) map[string]json.RawMessage {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(in))
+	for k, v := range in {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
 }
 
 // Build produces a Plan for the given transaction in the requested mode.
@@ -409,6 +508,9 @@ func (p *Plan) ToPorts() *ports.Plan {
 		Operations:         p.Operations,
 		SchemaFingerprints: p.SchemaFingerprints,
 		Digest:             p.Digest,
+		RootPlanDigest:     p.RootPlanDigest,
+		ParentActionID:     p.ParentActionID,
+		ChainDepth:         p.ChainDepth,
 	}
 	return out
 }
