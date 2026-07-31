@@ -152,6 +152,58 @@ func TestEndToEndPlanCreate(t *testing.T) {
 			t.Errorf("status in expect image should be %q, got %q", marker, raw)
 		}
 	}
+
+	// Now run plan check on a fresh target state. The row exists, so
+	// check must be READY.
+	planCheck(t, planPath, "READY")
+
+	// Mutate the row and re-check; expect CONFLICT.
+	_, err = execConn.Exec("UPDATE unredo_shop.orders SET status = ? WHERE user_id = ?", marker+"-mut", markerUser)
+	if err != nil {
+		t.Fatalf("mutate row: %v", err)
+	}
+	planCheck(t, planPath, "CONFLICT")
+
+	// Restore the row so subsequent tests see a clean state.
+	_, err = execConn.Exec("UPDATE unredo_shop.orders SET status = ? WHERE user_id = ?", marker, markerUser)
+	if err != nil {
+		t.Fatalf("restore row: %v", err)
+	}
+	planCheck(t, planPath, "READY")
+}
+
+// planCheck runs the CLI's plan check command and asserts the status
+// appears in the output. The unredo binary is invoked as a subprocess
+// so we exercise the same code path the user will.
+func planCheck(t *testing.T, planPath, wantStatus string) {
+	t.Helper()
+	repoRoot := repoRoot(t)
+	binary := filepath.Join(repoRoot, "bin", "unredo.exe")
+	cmd := exec.Command(binary,
+		"--config", "unredo.yaml",
+		"--profile", "local",
+		"plan", "check", planPath,
+		"--log-level", "error",
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"UNREDO_READER_PASSWORD="+readerPass,
+		"UNREDO_EXECUTOR_PASSWORD="+executorPass,
+	)
+	out, err := cmd.CombinedOutput()
+	// We only care about the textual status; CONFLICT exits non-zero
+	// by design. Use a substring check.
+	got := string(out)
+	if !strings.Contains(got, "status:        "+wantStatus) {
+		t.Fatalf("plan check did not report %s; got:\n%s", wantStatus, got)
+	}
+	if wantStatus == "CONFLICT" && err == nil {
+		t.Fatalf("plan check with CONFLICT must exit non-zero; err=nil output=%s", got)
+	}
+	if wantStatus == "READY" && err != nil {
+		t.Fatalf("plan check with READY must exit zero; err=%v output=%s", err, got)
+	}
+	_ = err
 }
 
 func readExecutedGTIDFor(db *sql.DB, marker string, userID int) (string, error) {

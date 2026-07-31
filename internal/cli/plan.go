@@ -10,7 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/girimi/unredo/internal/backends/mysql"
 	"github.com/girimi/unredo/internal/core"
+	"github.com/girimi/unredo/internal/executor"
 	"github.com/girimi/unredo/internal/planner"
 	"github.com/girimi/unredo/internal/ports"
 )
@@ -46,11 +48,72 @@ func newPlanCreateCmd() *cobra.Command {
 }
 
 func newPlanCheckCmd() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "check",
 		Short: "Verify a plan is still safe to apply (M2)",
-		RunE:  notImplemented("plan check"),
+		RunE:  runPlanCheck,
 		Args:  cobra.MinimumNArgs(1),
+	}
+	c.Flags().Bool("show-conflicts", false, "include per-conflict details in table output")
+	return c
+}
+
+// runPlanCheck loads a plan file and asks the executor to verify the
+// target database. It is read-only and never writes; conflicts are
+// aggregated and the CLI exits non-zero on anything other than READY.
+func runPlanCheck(cmd *cobra.Command, args []string) error {
+	planPath := args[0]
+	plan, err := planner.ReadFile(planPath)
+	if err != nil {
+		return fmt.Errorf("read plan: %w", err)
+	}
+	be, _, err := resolveBackend(cmd)
+	if err != nil {
+		return err
+	}
+	src, ok := be.(ports.ChangeSource)
+	if !ok {
+		return fmt.Errorf("backend %q does not implement ChangeSource", be.Name())
+	}
+	_ = src // source unused by check, but used to confirm backend is alive
+
+	timeoutStr, _ := cmd.Flags().GetString("timeout")
+	dur, _ := time.ParseDuration(timeoutStr)
+	if dur == 0 {
+		dur = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(cmd.Context(), dur)
+	defer cancel()
+
+	reader := mysqlBackendCheckReader(be)
+	if reader == nil {
+		return fmt.Errorf("backend %q does not support plan check", be.Name())
+	}
+	result, err := executor.Check(ctx, plan.ToPorts(), reader)
+	if err != nil {
+		return fmt.Errorf("check: %w", err)
+	}
+
+	format, _ := cmd.Flags().GetString("format")
+	if format == "json" {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+	showConflicts, _ := cmd.Flags().GetBool("show-conflicts")
+	printCheckHuman(cmd, result, showConflicts)
+
+	switch result.Status {
+	case executor.StatusReady:
+		return nil
+	case executor.StatusStaleSchema:
+		return fmt.Errorf("plan is stale: schema drifted")
+	case executor.StatusSourceMismatch:
+		return fmt.Errorf("plan was generated for a different instance")
+	case executor.StatusConflict:
+		return fmt.Errorf("plan has %d conflict(s); rerun with --show-conflicts", len(result.Conflicts))
+	default:
+		return fmt.Errorf("plan check returned %s", result.Status)
 	}
 }
 
@@ -207,4 +270,52 @@ func ensureParentDir(path string) error {
 func toolVersion() string {
 	// M1: a static version. M3 will read this from build-time -ldflags.
 	return "0.1.0-m1"
+}
+
+// mysqlBackendCheckReader pulls the MySQL backend's check reader out
+// of the resolved backend. Other backends would provide their own
+// type assertion here; for now MySQL is the only one.
+func mysqlBackendCheckReader(be ports.Backend) executor.Reader {
+	mbe, ok := be.(*mysql.Backend)
+	if !ok {
+		return nil
+	}
+	return mysql.NewCheckReaderFromBackend(mbe)
+}
+
+func printCheckHuman(cmd *cobra.Command, r *executor.CheckResult, showConflicts bool) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "status:        %s\n", r.Status)
+	fmt.Fprintf(out, "plan_digest:   %s\n", r.PlanDigest)
+	fmt.Fprintf(out, "target:        %s\n", r.TargetInstance)
+	fmt.Fprintf(out, "operations:    %d\n", r.OperationsTotal)
+	if len(r.SchemaChecks) > 0 {
+		fmt.Fprintf(out, "schema:\n")
+		for _, s := range r.SchemaChecks {
+			marker := "OK"
+			if !s.Match {
+				marker = "DRIFT"
+			}
+			fmt.Fprintf(out, "  %s %-30s plan=%s actual=%s\n", marker, s.Table, shortOrDash(s.PlanDigest), shortOrDash(s.ActualDigest))
+		}
+	}
+	if len(r.Conflicts) > 0 {
+		fmt.Fprintf(out, "conflicts: %d\n", len(r.Conflicts))
+		if showConflicts {
+			for _, c := range r.Conflicts {
+				fmt.Fprintf(out, "  op=%-3d %-25s %-15s col=%s msg=%s\n",
+					c.OperationSequence, c.Table, c.Kind, c.Column, c.Message)
+			}
+		}
+	}
+}
+
+func shortOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	if len(s) > 12 {
+		return s[:12] + "…"
+	}
+	return s
 }

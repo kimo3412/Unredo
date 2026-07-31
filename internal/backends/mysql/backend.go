@@ -18,6 +18,7 @@ import (
 	mysqlsource "github.com/girimi/unredo/internal/backends/mysql/source"
 	"github.com/girimi/unredo/internal/config"
 	"github.com/girimi/unredo/internal/core"
+	"github.com/girimi/unredo/internal/executor"
 	"github.com/girimi/unredo/internal/ports"
 	"github.com/girimi/unredo/internal/registry"
 )
@@ -114,13 +115,29 @@ func (b *Backend) Find(ctx context.Context, ref core.TransactionRef) (*core.Tran
 	return b.source.Find(ctx, ref)
 }
 
-// Check and Apply are not implemented in M0. They will land in M2.
-func (b *Backend) Check(_ context.Context, _ ports.Plan) ([]ports.Conflict, error) {
-	return nil, fmt.Errorf("mysql: plan check is part of M2, not M0")
+// Check verifies that the current state of the target database still
+// matches the plan's expect images. The executor itself lives in
+// internal/executor; this method adapts the result into ports.Conflict.
+func (b *Backend) Check(ctx context.Context, plan ports.Plan) ([]ports.Conflict, error) {
+	reader := NewCheckReader(b.targetDSN, b.instanceID)
+	result, err := executor.Check(ctx, &plan, reader)
+	if err != nil {
+		return nil, err
+	}
+	conflicts := make([]ports.Conflict, 0, len(result.Conflicts))
+	for _, c := range result.Conflicts {
+		conflicts = append(conflicts, ports.Conflict{
+			OperationSequence: c.OperationSequence,
+			Table:             c.Table,
+			Kind:              string(c.Kind),
+			Message:           c.Message,
+		})
+	}
+	return conflicts, nil
 }
 
 func (b *Backend) Apply(_ context.Context, _ ports.Plan, _ string) (ports.ExecutionResult, error) {
-	return ports.ExecutionResult{}, fmt.Errorf("mysql: plan apply is part of M2, not M0")
+	return ports.ExecutionResult{}, fmt.Errorf("mysql: plan apply is part of M2 follow-up; only check is wired so far")
 }
 
 // RunDoctor exposes the doctor checks for the CLI.
@@ -141,13 +158,12 @@ func buildDSN(addr, user, passwordEnv string, serverID uint32) (string, error) {
 	cfg.ParseTime = false
 	cfg.Loc = time.UTC
 	cfg.InterpolateParams = false
-	cfg.Params = map[string]string{
-		"time_zone": "'+00:00'",
-	}
-	if serverID != 0 {
-		// The driver doesn't expose a server_id knob; we pass it through
-		// the source package where it actually matters (replication handshake).
-	}
+	// We deliberately do NOT set session time_zone here. The binlog
+	// stores TIMESTAMP text in the writer's session timezone, so the
+	// read path must use the same default to see byte-equal values.
+	// M2 trust model: both writer and reader share the same instance
+	// default time_zone. Cross-timezone plans are out of scope for M2.
+	_ = serverID
 	return cfg.FormatDSN(), nil
 }
 

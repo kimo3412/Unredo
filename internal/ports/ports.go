@@ -79,8 +79,10 @@ type Conflict struct {
 // Plan is a backend-neutral view of an executable plan. The on-disk
 // representation may add backend extensions; this is the core subset.
 type Plan struct {
-	Ref       core.TransactionRef `json:"source"`
-	Operations []PlanOperation    `json:"operations"`
+	Ref                core.TransactionRef `json:"source"`
+	Operations         []PlanOperation     `json:"operations"`
+	SchemaFingerprints map[string]string   `json:"schema_fingerprints,omitempty"`
+	Digest             string              `json:"digest,omitempty"`
 }
 
 // PlanOperation is one row-level step the executor will perform.

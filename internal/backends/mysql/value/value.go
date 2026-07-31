@@ -94,16 +94,71 @@ func kindForType(mysqlType string) core.ValueKind {
 func ptrNative(s string) *core.NativeType { n := core.NativeType(s); return &n }
 
 func decodeInteger(ct ColumnType, raw interface{}) (core.Value, error) {
-	data, err := marshalJSON(raw)
+	// The driver may hand us int64 (preferred) or the textual form as
+	// []byte. We always want a canonical JSON-number Data, so we
+	// normalise to a string and then strip the surrounding quotes.
+	// json.Marshal on a string would base64-encode the bytes, so we
+	// never go through that path for integers.
+	var s string
+	switch x := raw.(type) {
+	case []byte:
+		s = string(x)
+	case string:
+		s = x
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		out, _ := json.Marshal(x)
+		return core.Value{
+			Kind:     core.KindInteger,
+			Encoding: "json",
+			Data:     core.RawJSON(out),
+			Native:   ptrNative(ct.ColumnType),
+		}, nil
+	default:
+		out, err := json.Marshal(x)
+		if err != nil {
+			return core.Value{}, fmt.Errorf("mysql: integer column %q: %w", ct.Name, err)
+		}
+		return core.Value{
+			Kind:     core.KindInteger,
+			Encoding: "json",
+			Data:     core.RawJSON(out),
+			Native:   ptrNative(ct.ColumnType),
+		}, nil
+	}
+	clean, err := parseIntegerLiteral(s)
 	if err != nil {
-		return core.Value{}, err
+		return core.Value{}, fmt.Errorf("mysql: integer column %q: %w", ct.Name, err)
 	}
 	return core.Value{
 		Kind:     core.KindInteger,
 		Encoding: "json",
-		Data:     data,
+		Data:     core.RawJSON(clean),
 		Native:   ptrNative(ct.ColumnType),
 	}, nil
+}
+
+func parseIntegerLiteral(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("empty integer")
+	}
+	neg := false
+	if s[0] == '-' || s[0] == '+' {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	if s == "" {
+		return "", fmt.Errorf("no digits")
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return "", fmt.Errorf("non-digit %q", c)
+		}
+	}
+	if neg {
+		return "-" + s, nil
+	}
+	return s, nil
 }
 
 func decodeDecimal(ct ColumnType, raw interface{}) (core.Value, error) {
@@ -308,4 +363,26 @@ func asBytes(v interface{}) ([]byte, bool) {
 		return []byte(x), true
 	}
 	return nil, false
+}
+
+// DecodeRow is a convenience for SELECT-style reads where the column
+// order matches the column list passed in. raw is the []interface{}
+// returned by database/sql; ct is the matching column type metadata.
+func DecodeRow(cols []ColumnType, raw []interface{}) (core.Row, error) {
+	if len(cols) != len(raw) {
+		return core.Row{}, fmt.Errorf("mysql: row has %d values, expected %d columns", len(raw), len(cols))
+	}
+	out := core.Row{
+		Columns: make([]string, 0, len(cols)),
+		Values:  make([]core.Value, 0, len(cols)),
+	}
+	for i, v := range raw {
+		cv, err := Decode(cols[i], v)
+		if err != nil {
+			return core.Row{}, err
+		}
+		out.Columns = append(out.Columns, cols[i].Name)
+		out.Values = append(out.Values, cv)
+	}
+	return out, nil
 }

@@ -382,6 +382,19 @@ func computeDigest(p *Plan) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// ToPorts returns a backend-neutral view of the plan. The executor
+// works on this subset; the file format keeps the richer fields for
+// audits and reproducibility.
+func (p *Plan) ToPorts() *ports.Plan {
+	out := &ports.Plan{
+		Ref:                p.Source,
+		Operations:         p.Operations,
+		SchemaFingerprints: p.SchemaFingerprints,
+		Digest:             p.Digest,
+	}
+	return out
+}
+
 // canonicalJSON produces a deterministic JSON encoding: object keys are
 // sorted, indentation is removed, and HTML escapes are disabled. The
 // same plan must always serialise to the same bytes.
