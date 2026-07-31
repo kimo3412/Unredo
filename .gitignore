@@ -55,6 +55,10 @@ logs/
 # *.redo.json
 # *.resolved.json
 
+# Test data lives under testdata/; committed plans there are documentation
+# only and never contain real customer data.
+!testdata/plans/
+
 # Local Unredo config overrides
 unredo.local.yaml
 unredo.local.yml

@@ -1,4 +1,4 @@
-.PHONY: tidy build test doctor txn-list seed unredo fmt vet run
+.PHONY: tidy build test test-integration doctor txn-list seed unredo fmt vet run clean-plans
 
 GO ?= go
 
@@ -13,9 +13,13 @@ fmt:
 
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags=integration ./...
 
 test:
 	$(GO) test ./...
+
+test-integration: build
+	$(GO) test -tags=integration -timeout 60s ./...
 
 run: build
 	./bin/unredo.exe --config unredo.yaml --profile local
@@ -31,3 +35,7 @@ seed:
 
 unredo: build
 	./bin/unredo.exe --config unredo.yaml --profile local
+
+clean-plans:
+	rm -f testdata/plans/*.json
+
