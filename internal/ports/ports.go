@@ -79,6 +79,9 @@ type Conflict struct {
 // Plan is a backend-neutral view of an executable plan. The on-disk
 // representation may add backend extensions; this is the core subset.
 type Plan struct {
+	PlanID             string              `json:"plan_id,omitempty"`
+	Mode               string              `json:"mode,omitempty"`               // "revert" or "reapply"
+	ExecutionClass     string              `json:"execution_class,omitempty"`     // "safe" or "unsafe_resolved"
 	Ref                core.TransactionRef `json:"source"`
 	Operations         []PlanOperation     `json:"operations"`
 	SchemaFingerprints map[string]string   `json:"schema_fingerprints,omitempty"`
@@ -102,11 +105,21 @@ type ExecutionResult struct {
 	ActionID         string `json:"action_id,omitempty"`
 }
 
+// ApplyRequest is the per-invocation state an executor needs that is
+// not already on the plan: an action id, the operator name, the
+// reason, and the short-confirm required for non-interactive flows.
+type ApplyRequest struct {
+	ActionID     string
+	OperatorName string
+	Reason       string
+	Confirm      string
+}
+
 // PlanExecutor checks and applies plans against the target database.
 // Check is read-only; Apply writes.
 type PlanExecutor interface {
 	Check(ctx context.Context, plan Plan) ([]Conflict, error)
-	Apply(ctx context.Context, plan Plan, actionID string) (ExecutionResult, error)
+	Apply(ctx context.Context, plan Plan, req ApplyRequest) (ExecutionResult, error)
 }
 
 // Backend bundles every interface a backend must satisfy.

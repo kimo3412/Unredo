@@ -136,8 +136,59 @@ func (b *Backend) Check(ctx context.Context, plan ports.Plan) ([]ports.Conflict,
 	return conflicts, nil
 }
 
-func (b *Backend) Apply(_ context.Context, _ ports.Plan, _ string) (ports.ExecutionResult, error) {
-	return ports.ExecutionResult{}, fmt.Errorf("mysql: plan apply is part of M2 follow-up; only check is wired so far")
+// Apply executes a plan in a single InnoDB transaction together with
+// the action marker. See ports.ApplyRequest for what the caller
+// supplies; everything else comes from the plan.
+func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyRequest) (ports.ExecutionResult, error) {
+	writer := NewApplyWriterFromBackend(b)
+	opts, err := b.buildApplyOptions(plan, req)
+	if err != nil {
+		return ports.ExecutionResult{}, err
+	}
+	return writer.Apply(ctx, &plan, opts)
+}
+
+// buildApplyOptions derives the marker row from a plan and the
+// caller-supplied action id. plan_id is taken from the plan file
+// (a ULID); the action type and target state come from plan.Mode.
+func (b *Backend) buildApplyOptions(plan ports.Plan, req ports.ApplyRequest) (executor.ApplyOptions, error) {
+	planID, err := ulidBytes(plan.PlanID)
+	if err != nil {
+		return executor.ApplyOptions{}, fmt.Errorf("mysql: plan_id %q: %w", plan.PlanID, err)
+	}
+	actionIDBytes, err := ulidBytes(req.ActionID)
+	if err != nil {
+		return executor.ApplyOptions{}, fmt.Errorf("mysql: action_id %q: %w", req.ActionID, err)
+	}
+	var actionType, targetState string
+	switch plan.Mode {
+	case "revert":
+		actionType = "REVERT"
+		targetState = "ORIGINAL_REVERTED"
+	case "reapply":
+		actionType = "REAPPLY"
+		targetState = "ORIGINAL_APPLIED"
+	default:
+		return executor.ApplyOptions{}, fmt.Errorf("mysql: plan mode %q unsupported", plan.Mode)
+	}
+	executionClass := "SAFE"
+	if plan.ExecutionClass == "unsafe_resolved" {
+		executionClass = "UNSAFE_RESOLVED"
+	}
+	chainDepth := uint32(0) // M2 has no chain concept; M3 will compute it
+	return executor.ApplyOptions{
+		PlanID:                     planID,
+		ActionID:                   actionIDBytes,
+		ActionType:                 actionType,
+		TargetState:                targetState,
+		ChainDepth:                 chainDepth,
+		ParentActionID:             nil,
+		OperatorName:               req.OperatorName,
+		Reason:                     req.Reason,
+		ExecutionClass:             executionClass,
+		SourceNativeTransactionID:  plan.Ref.NativeTransactionID,
+		Confirm:                    req.Confirm,
+	}, nil
 }
 
 // RunDoctor exposes the doctor checks for the CLI.

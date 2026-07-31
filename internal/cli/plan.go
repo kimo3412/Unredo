@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
 	"github.com/girimi/unredo/internal/backends/mysql"
@@ -121,13 +122,95 @@ func newPlanApplyCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "apply",
 		Short: "Execute a compensation plan (M2)",
-		RunE:  notImplemented("plan apply"),
+		RunE:  runPlanApply,
 		Args:  cobra.MinimumNArgs(1),
 	}
 	c.Flags().String("confirm-sha", "", "first 8 chars of the plan digest")
 	c.Flags().Bool("non-interactive", false, "do not prompt")
 	c.Flags().String("accept-risk", "", "first 8 chars of the resolved plan digest (unsafe plans only)")
+	c.Flags().String("operator", os.Getenv("USER"), "operator name recorded in the action marker")
+	c.Flags().String("reason", "", "free-text reason recorded in the action marker")
 	return c
+}
+
+// runPlanApply loads a plan, mints an action id, and calls the
+// backend's Apply. The whole operation runs in a single InnoDB
+// transaction so the marker and data writes commit together.
+func runPlanApply(cmd *cobra.Command, args []string) error {
+	planPath := args[0]
+	plan, err := planner.ReadFile(planPath)
+	if err != nil {
+		return fmt.Errorf("read plan: %w", err)
+	}
+	be, _, err := resolveBackend(cmd)
+	if err != nil {
+		return err
+	}
+	executor, ok := be.(ports.PlanExecutor)
+	if !ok {
+		return fmt.Errorf("backend %q does not implement PlanExecutor", be.Name())
+	}
+
+	confirm, _ := cmd.Flags().GetString("confirm-sha")
+	acceptRisk, _ := cmd.Flags().GetString("accept-risk")
+	nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
+	operator, _ := cmd.Flags().GetString("operator")
+	reason, _ := cmd.Flags().GetString("reason")
+	if operator == "" {
+		operator = os.Getenv("USER")
+	}
+	if operator == "" {
+		return fmt.Errorf("--operator is required (or set $USER / $USERNAME)")
+	}
+
+	if plan.ExecutionClass == "unsafe_resolved" {
+		if acceptRisk == "" {
+			return fmt.Errorf("resolved plan requires --accept-risk <short-digest>")
+		}
+		if acceptRisk != planner.ShortDigest(plan.Digest) {
+			return fmt.Errorf("--accept-risk %q does not match plan digest", acceptRisk)
+		}
+	}
+	if !nonInteractive {
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"About to apply plan %s\n  mode:        %s\n  digest:      sha256:%s\n  operations:  %d\n  class:       %s\n  operator:    %s\n",
+			plan.PlanID, plan.Mode, planner.ShortDigest(plan.Digest), len(plan.Operations), plan.ExecutionClass, operator)
+		fmt.Fprintf(cmd.OutOrStdout(), "Type the first 8 hex chars of the digest to confirm: ")
+		var got string
+		if _, err := fmt.Scanln(&got); err != nil {
+			return fmt.Errorf("read confirmation: %w", err)
+		}
+		if got != planner.ShortDigest(plan.Digest) {
+			return fmt.Errorf("confirmation %q does not match; aborting", got)
+		}
+	} else if confirm != "" && confirm != planner.ShortDigest(plan.Digest) {
+		return fmt.Errorf("--confirm-sha %q does not match plan digest sha256:%s", confirm, planner.ShortDigest(plan.Digest))
+	}
+
+	timeoutStr, _ := cmd.Flags().GetString("timeout")
+	dur, _ := time.ParseDuration(timeoutStr)
+	if dur == 0 {
+		dur = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(cmd.Context(), dur)
+	defer cancel()
+
+	actionID := newActionID()
+	req := ports.ApplyRequest{
+		ActionID:     actionID,
+		OperatorName: operator,
+		Reason:       reason,
+		Confirm:      confirm,
+	}
+	result, err := executor.Apply(ctx, *plan.ToPorts(), req)
+	if err != nil {
+		return fmt.Errorf("apply: %w", err)
+	}
+
+	fmt.Fprintf(cmd.OutOrStdout(), "action_id:    %s\n", actionID)
+	fmt.Fprintf(cmd.OutOrStdout(), "gtid:         %s\n", result.CompensatingGTID)
+	fmt.Fprintf(cmd.OutOrStdout(), "affected:     %d\n", result.AffectedRows)
+	return nil
 }
 
 func newPlanResolveCmd() *cobra.Command {
@@ -318,4 +401,10 @@ func shortOrDash(s string) string {
 		return s[:12] + "…"
 	}
 	return s
+}
+
+// newActionID mints a fresh ULID. M2 hands these out to action
+// markers; M3 will record chain depth against the existing root.
+func newActionID() string {
+	return ulid.Make().String()
 }

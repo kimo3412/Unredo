@@ -157,7 +157,7 @@ func valueToDriverArg(v core.Value) interface{} {
 	case core.KindInteger, core.KindDecimal, core.KindFloat:
 		// Driver accepts string for DECIMAL; for integer we pass raw
 		// JSON number.
-		return jsonBytes(v.Data)
+		return []byte(v.Data)
 	case core.KindText, core.KindEnum, core.KindSet:
 		return string(v.Data)
 	case core.KindBinary, core.KindBit:
@@ -176,8 +176,6 @@ func valueToDriverArg(v core.Value) interface{} {
 		return string(v.Data)
 	}
 }
-
-func jsonBytes(b core.RawJSON) []byte { return []byte(b) }
 
 func unquoteJSONString(s string) string {
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {

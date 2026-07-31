@@ -329,6 +329,12 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 		Schema: strings.TrimRight(string(b.tableMap.Schema), " "),
 		Name:   strings.TrimRight(string(b.tableMap.Table), " "),
 	}
+	// Skip the marker and other system tables. They show up in the
+	// binlog whenever we INSERT into action_markers, but the unredo
+	// plan never operates on them.
+	if isSystemTable(tableRef) {
+		return nil
+	}
 	cols, err := b.columnsFor(tableRef)
 	if err != nil {
 		return err
@@ -550,6 +556,18 @@ func classifyStatement(stmt string) stmtKind {
 		return stmtNonRow
 	}
 	return stmtRow
+}
+
+// isSystemTable reports whether the binlog iterator should ignore
+// row events on this table. We never want to plan against the
+// unredo marker table, the mysql system schema, or information_schema.
+func isSystemTable(t core.TableRef) bool {
+	switch t.Schema {
+	case "mysql", "information_schema", "performance_schema", "sys",
+		"unredo_meta":
+		return true
+	}
+	return false
 }
 
 func firstLine(s string) string {

@@ -170,6 +170,46 @@ func TestEndToEndPlanCreate(t *testing.T) {
 		t.Fatalf("restore row: %v", err)
 	}
 	planCheck(t, planPath, "READY")
+
+	// Now apply. The row must be removed and a marker row inserted.
+	planApply(t, planPath, planner.ShortDigest(plan.Digest), 0, true)
+
+	// Re-apply must be blocked by the plan_id UNIQUE.
+	planApply(t, planPath, planner.ShortDigest(plan.Digest), 1, false)
+}
+
+// planApply runs the unredo CLI's apply subcommand and checks the
+// exit code. The expectedExitZero bool controls which exit code is
+// required. The full unredo binary is invoked so we exercise the
+// end-to-end path including marker write, transaction commit, and
+// (on the second call) replay protection.
+func planApply(t *testing.T, planPath, confirm string, expectedExit int, expectedExitZero bool) {
+	t.Helper()
+	repoRoot := repoRoot(t)
+	binary := filepath.Join(repoRoot, "bin", "unredo.exe")
+	cmd := exec.Command(binary,
+		"--config", "unredo.yaml",
+		"--profile", "local",
+		"plan", "apply", planPath,
+		"--non-interactive",
+		"--confirm-sha", confirm,
+		"--operator", "test",
+		"--log-level", "error",
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"UNREDO_READER_PASSWORD="+readerPass,
+		"UNREDO_EXECUTOR_PASSWORD="+executorPass,
+	)
+	out, err := cmd.CombinedOutput()
+	exitOK := err == nil
+	if expectedExitZero && !exitOK {
+		t.Fatalf("expected apply to succeed; got err=%v\n%s", err, out)
+	}
+	if !expectedExitZero && exitOK {
+		t.Fatalf("expected apply to fail; got success\n%s", out)
+	}
+	_ = expectedExit
 }
 
 // planCheck runs the CLI's plan check command and asserts the status

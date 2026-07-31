@@ -387,6 +387,9 @@ func computeDigest(p *Plan) string {
 // audits and reproducibility.
 func (p *Plan) ToPorts() *ports.Plan {
 	out := &ports.Plan{
+		PlanID:             p.PlanID,
+		Mode:               string(p.Mode),
+		ExecutionClass:     string(p.ExecutionClass),
 		Ref:                p.Source,
 		Operations:         p.Operations,
 		SchemaFingerprints: p.SchemaFingerprints,
