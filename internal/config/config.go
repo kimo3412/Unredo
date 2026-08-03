@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -35,6 +36,37 @@ type Source struct {
 	BinlogPath string `yaml:"binlog_path,omitempty"`
 }
 
+// Save writes a complete config with restrictive permissions. Passwords are
+// never part of Config, so callers can safely persist environment references.
+func Save(path string, c *Config) error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.Version != Version {
+		return fmt.Errorf("unsupported config version %d, want %d", c.Version, Version)
+	}
+	if len(c.Profiles) == 0 {
+		return errors.New("config has no profiles")
+	}
+	raw, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create config directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return fmt.Errorf("write config %q: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("restrict config permissions: %w", err)
+	}
+	return nil
+}
+
 // Target is the connection info for executing compensation.
 type Target struct {
 	Address     string `yaml:"address"`
@@ -44,14 +76,14 @@ type Target struct {
 
 // Policy controls safety thresholds and timeout.
 type Policy struct {
-	RequireGTID            bool          `yaml:"require_gtid"`
-	RequireFullRowImage    bool          `yaml:"require_full_row_image"`
-	RequirePrimaryKey      bool          `yaml:"require_primary_key"`
-	MaxTransactionRows     int           `yaml:"max_transaction_rows"`
-	MaxTransactionBytes    int64         `yaml:"max_transaction_bytes"`
-	MaxPlanBytes           int64         `yaml:"max_plan_bytes"`
-	MaxActionDepth         int           `yaml:"max_action_depth"`
-	LockWaitTimeout        time.Duration `yaml:"lock_wait_timeout"`
+	RequireGTID         bool          `yaml:"require_gtid"`
+	RequireFullRowImage bool          `yaml:"require_full_row_image"`
+	RequirePrimaryKey   bool          `yaml:"require_primary_key"`
+	MaxTransactionRows  int           `yaml:"max_transaction_rows"`
+	MaxTransactionBytes int64         `yaml:"max_transaction_bytes"`
+	MaxPlanBytes        int64         `yaml:"max_plan_bytes"`
+	MaxActionDepth      int           `yaml:"max_action_depth"`
+	LockWaitTimeout     time.Duration `yaml:"lock_wait_timeout"`
 }
 
 // Profile is a named backend configuration.
@@ -64,7 +96,7 @@ type Profile struct {
 
 // Config is the on-disk schema. Version must equal Version.
 type Config struct {
-	Version  int               `yaml:"version"`
+	Version  int                `yaml:"version"`
 	Profiles map[string]Profile `yaml:"profiles"`
 }
 

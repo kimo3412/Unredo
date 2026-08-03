@@ -28,6 +28,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/girimi/unredo/internal/config"
 	"github.com/girimi/unredo/internal/planner"
 )
 
@@ -523,6 +524,72 @@ func TestEndToEndResolveOverwriteRequiresRiskConfirmation(t *testing.T) {
 	}
 	if status != marker || amount != "10.00" {
 		t.Fatalf("resolved overwrite restored status=%q amount=%q; want %q, 10.00", status, amount, marker)
+	}
+}
+
+func TestInitGeneratesProfileAppliesMetaAndRunsDoctor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	var mysqlServerID uint32
+	if err := rootConn.QueryRow("SELECT @@global.server_id").Scan(&mysqlServerID); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "unredo.yaml")
+	grantsPath := filepath.Join(dir, "grants.sql")
+	repoRoot := repoRoot(t)
+	cmd := exec.Command(filepath.Join(repoRoot, "bin", "unredo.exe"),
+		"--config", configPath,
+		"--profile", "init-integration",
+		"init",
+		"--non-interactive",
+		"--address", "127.0.0.1:3306",
+		"--reader-user", readerUser,
+		"--reader-password-env", "UNREDO_READER_PASSWORD",
+		"--executor-user", executorUser,
+		"--executor-password-env", "UNREDO_EXECUTOR_PASSWORD",
+		"--database", "unredo_shop",
+		"--grants-output", grantsPath,
+		"--apply-meta",
+		"--admin-user", "root",
+		"--admin-password-env", "UNREDO_TEST_ADMIN_PASSWORD",
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"UNREDO_READER_PASSWORD="+readerPass,
+		"UNREDO_EXECUTOR_PASSWORD="+executorPass,
+		"UNREDO_TEST_ADMIN_PASSWORD="+rootPass,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "target.meta_schema") || !strings.Contains(string(out), "meta_schema:     applied") {
+		t.Fatalf("init did not apply metadata and run doctor:\n%s", out)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := cfg.Profile("init-integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Source.ServerID == 0 || profile.Source.ServerID == mysqlServerID {
+		t.Fatalf("generated server_id %d conflicts with MySQL server_id %d", profile.Source.ServerID, mysqlServerID)
+	}
+	grantSQL, err := os.ReadFile(grantsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToUpper(string(grantSQL)), "IDENTIFIED BY") {
+		t.Fatal("generated grant SQL contains an account password clause")
 	}
 }
 

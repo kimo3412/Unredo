@@ -487,6 +487,11 @@ func (b *binlogIterator) handleQuery(ev *replication.BinlogEvent) error {
 		if !hasReasonPrefix(b.current.Reasons, "non-row statement:") {
 			b.current.Reasons = append(b.current.Reasons, reason)
 		}
+		// DDL and DCL QueryEvents are autocommit transactions and do not
+		// receive an XID_EVENT. Mark them complete here so their state cannot
+		// leak into the next GTID/row transaction.
+		b.current.CommitTime = b.eventTime(ev)
+		b.current.Rows = b.pending
 	}
 	return nil
 }

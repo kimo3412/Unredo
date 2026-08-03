@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**M0-M2 已完成，M3 核心 reapply 与冲突 resolve 闭环已跑通**。初始化向导、性能基准、完整交替 action 链和实验版发布仍待办。
+> 当前状态：**M0-M2 已完成，M3 核心 reapply、冲突 resolve 与初始化流程已跑通**。性能基准、完整交替 action 链和实验版发布仍待办。
 
 ## 计划中的五分钟上手流程
 
@@ -25,25 +25,51 @@ enforce_gtid_consistency=ON
 
 ### 2. 初始化账号、元数据库与配置
 
-`unredo init` 目前还是占位命令。生产环境应由 DBA 创建 reader/executor 最小权限账号，执行元数据 migration，再参照仓库的 `unredo.yaml` 编写 profile：
+`unredo init` 会生成 profile、随机并持久化 replication `server_id`、输出最小权限 GRANT SQL，并在最后运行 doctor。它不会生成默认账号密码，也不会把密码写入配置：
 
 ```bash
-mysql < migrations/mysql/001_init.sql
-# 密码只通过 profile 中 password_env 指向的环境变量提供
+unredo init \
+  --profile production \
+  --address mysql.example.com:3306 \
+  --database shop \
+  --database billing
 ```
 
-`scripts/setup_test_users.sql` 和 `scripts/init_m0_schema.sql` 会删除并重建测试库，只适用于一次性本地测试环境，不能在生产执行。
+首次运行时如果 reader/executor 账号还不存在，可以先只生成文件：
 
-后续的 `unredo init --profile local` 向导将：
+```bash
+unredo init \
+  --profile production \
+  --address mysql.example.com:3306 \
+  --database shop \
+  --skip-doctor
+```
+
+DBA 审查并应用生成的 GRANT SQL、设置密码环境变量后，再运行 `unredo doctor`。如需让 init 创建 `unredo_meta`，必须显式提供临时管理凭据引用：
+
+```bash
+export MYSQL_ADMIN_PASSWORD='...'
+unredo init \
+  --profile production \
+  --address mysql.example.com:3306 \
+  --database shop \
+  --apply-meta \
+  --admin-user root \
+  --admin-password-env MYSQL_ADMIN_PASSWORD
+```
+
+管理账号和环境变量引用不会写入 `unredo.yaml`。`init` 不会创建带默认密码的用户、修改 MySQL 全局配置或重启数据库。
+
+向导会：
 
 - 检查 MySQL 版本、ROW/FULL/GTID 和 binlog 保留状态。
 - 为 profile 生成并持久化随机 replication server ID。
-- 生成 reader/executor 最小权限 SQL。
+- 生成 reader/executor 最小权限 GRANT SQL，账号密码由 DBA 或密钥系统创建。
 - 生成不含明文密码的 `unredo.yaml`。
-- 经确认后初始化 `unredo_meta`。
+- 只有显式 `--apply-meta` 时才初始化 `unredo_meta`。
 - 给出尚需 DBA 手工完成的步骤。
 
-账号创建和 migration 默认需要确认；管理凭据不会保存到配置文件。
+`scripts/setup_test_users.sql` 和 `scripts/init_m0_schema.sql` 会删除并重建测试库，只适用于一次性本地测试环境，不能在生产执行。
 
 ### 3. 验证环境
 

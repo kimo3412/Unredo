@@ -160,9 +160,19 @@ func checkServerID(ctx context.Context, db *sql.DB, serverID uint32, r *Report) 
 	r.Checks = append(r.Checks, Check{Name: "mysql.replication_server_id", Severity: SeverityOK, Message: fmt.Sprintf("%d; no conflict among visible replicas (best effort)", serverID)})
 }
 
-func checkTarget(_ context.Context, _ *sql.DB, _ config.Policy, _ *Report) error {
-	// M0 only needs a successful ping; full executor privilege checks
-	// arrive with M2's plan apply. Keep the hook for symmetry.
+func checkTarget(ctx context.Context, db *sql.DB, _ config.Policy, r *Report) error {
+	var count int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = 'unredo_meta' AND table_name = 'action_markers'`).Scan(&count)
+	if err != nil {
+		r.Checks = append(r.Checks, Check{Name: "target.meta_schema", Severity: SeverityError, Message: "could not inspect unredo_meta: " + err.Error()})
+		return nil
+	}
+	if count != 1 {
+		r.Checks = append(r.Checks, Check{Name: "target.meta_schema", Severity: SeverityError, Message: "unredo_meta.action_markers is missing; run unredo init --apply-meta"})
+		return nil
+	}
+	r.Checks = append(r.Checks, Check{Name: "target.meta_schema", Severity: SeverityOK, Message: "unredo_meta.action_markers exists"})
 	return nil
 }
 
