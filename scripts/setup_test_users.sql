@@ -9,7 +9,6 @@ CREATE USER 'unredo_reader'@'127.0.0.1' IDENTIFIED BY 'unredo_reader_pw';
 CREATE USER 'unredo_executor'@'127.0.0.1' IDENTIFIED BY 'unredo_executor_pw';
 
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'unredo_reader'@'127.0.0.1';
-GRANT SELECT ON information_schema.* TO 'unredo_reader'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE, DELETE ON unredo_shop.* TO 'unredo_executor'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE, DELETE ON unredo_meta.* TO 'unredo_executor'@'127.0.0.1';
 

@@ -1,6 +1,6 @@
 # Binaries
-unredo
-unredo-*
+/unredo
+/unredo-*
 *.exe
 *.exe~
 *.dll
