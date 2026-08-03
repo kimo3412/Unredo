@@ -67,8 +67,13 @@ jobs:
         run: |
           docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/setup_test_users.sql
           docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/init_m0_schema.sql
+          docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/setup_ci_users.sql
           docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/seed_fixtures.sql
       - name: Run integration suite
+        env:
+          UNREDO_READER_PASSWORD: unredo_reader_pw
+          UNREDO_EXECUTOR_PASSWORD: unredo_executor_pw
         run: |
           go build -o bin/unredo.exe ./cmd/unredo
+          ./bin/unredo.exe doctor --profile local
           go test -tags=integration -count=1 -timeout 300s ./tests/integration
