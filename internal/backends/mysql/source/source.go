@@ -5,6 +5,7 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -76,6 +77,63 @@ func (s *Source) settings(ctx context.Context) (format, rowImage, gtid, rowMetad
 	err = db.QueryRowContext(ctx,
 		"SELECT @@global.binlog_format, @@global.binlog_row_image, @@global.gtid_mode, @@global.binlog_row_metadata").Scan(&format, &rowImage, &gtid, &rowMetadata)
 	return
+}
+
+// CurrentCursor captures the next binlog position before an apply starts.
+// Correlation later scans forward from this exact boundary and matches the
+// action marker, so concurrent transactions cannot make us guess a GTID.
+func (s *Source) CurrentCursor(ctx context.Context) (json.RawMessage, error) {
+	db, err := sql.Open("mysql", s.dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	var (
+		file                    string
+		position                uint32
+		doDB, ignoreDB, gtidSet sql.NullString
+	)
+	scan := func(statement string) error {
+		return db.QueryRowContext(ctx, statement).Scan(&file, &position, &doDB, &ignoreDB, &gtidSet)
+	}
+	if err := scan("SHOW BINARY LOG STATUS"); err != nil {
+		// MySQL 8.0 uses the legacy spelling; 8.2+ renamed it. Supporting
+		// both keeps the correlation path aligned with the stated MySQL 8.x
+		// compatibility range.
+		if legacyErr := scan("SHOW MASTER STATUS"); legacyErr != nil {
+			return nil, fmt.Errorf("mysql: capture binlog cursor: %v; legacy fallback: %w", err, legacyErr)
+		}
+	}
+	return json.Marshal(cursorData{File: file, StartPos: position})
+}
+
+// FindActionGTID scans committed transactions from a captured cursor and
+// returns the GTID of the transaction containing the exact action marker.
+func (s *Source) FindActionGTID(ctx context.Context, from json.RawMessage, actionID []byte) (string, error) {
+	if len(actionID) != 16 {
+		return "", fmt.Errorf("mysql: action id must be 16 bytes, got %d", len(actionID))
+	}
+	it, err := s.Scan(ctx, ports.ScanScope{FromCursor: from})
+	if err != nil {
+		return "", err
+	}
+	defer it.Close()
+	binlog, ok := it.(*binlogIterator)
+	if !ok {
+		return "", fmt.Errorf("mysql: unexpected binlog iterator %T", it)
+	}
+	for {
+		txn, err := binlog.Next(ctx)
+		if err != nil {
+			return "", err
+		}
+		if binlog.lastTransactionHasAction(actionID) {
+			if txn.GTID == "" {
+				return "", fmt.Errorf("mysql: action marker transaction has no GTID")
+			}
+			return txn.GTID, nil
+		}
+	}
 }
 
 // Scan opens a replication stream and returns an iterator.
@@ -235,21 +293,23 @@ type binlogIterator struct {
 	instanceID string
 	inspector  *schema.Inspector
 
-	mu        sync.Mutex
-	pending   []core.RowChange
-	current   *core.Transaction
-	started   time.Time
-	tableID   uint64
-	tableMap  *replication.TableMapEvent
-	colCache  map[string][]columnInfo
-	emitted   int
-	limit     int
-	exhausted bool
-	maxRows   int
-	maxBytes  int64
-	rowCount  int
-	rowBytes  int64
-	tooLarge  bool
+	mu                  sync.Mutex
+	pending             []core.RowChange
+	current             *core.Transaction
+	started             time.Time
+	tableID             uint64
+	tableMap            *replication.TableMapEvent
+	colCache            map[string][]columnInfo
+	emitted             int
+	limit               int
+	exhausted           bool
+	maxRows             int
+	maxBytes            int64
+	rowCount            int
+	rowBytes            int64
+	tooLarge            bool
+	markerActionIDs     [][]byte
+	lastMarkerActionIDs [][]byte
 }
 
 func (b *binlogIterator) Close() error {
@@ -272,8 +332,10 @@ func (b *binlogIterator) Next(ctx context.Context) (*core.Transaction, error) {
 
 		if b.current != nil && !b.current.CommitTime.IsZero() {
 			out := b.current
+			b.lastMarkerActionIDs = b.markerActionIDs
 			b.current = nil
 			b.pending = nil
+			b.markerActionIDs = nil
 			b.rowCount = 0
 			b.rowBytes = 0
 			b.tooLarge = false
@@ -373,6 +435,10 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 		Schema: strings.TrimRight(string(b.tableMap.Schema), " "),
 		Name:   strings.TrimRight(string(b.tableMap.Table), " "),
 	}
+	if isActionMarkerTable(tableRef) {
+		b.captureActionMarkers(raw, opForEventType(ev.Header.EventType))
+		return nil
+	}
 	// Skip the marker and other system tables. They show up in the
 	// binlog whenever we INSERT into action_markers, but the unredo
 	// plan never operates on them.
@@ -450,8 +516,52 @@ func (b *binlogIterator) handleRowEvent(ev *replication.BinlogEvent) error {
 	return nil
 }
 
+func (b *binlogIterator) captureActionMarkers(raw *replication.RowsEvent, op core.OperationKind) {
+	if op != core.OpInsert || b.tableMap == nil {
+		return
+	}
+	actionIDColumn := -1
+	for i, name := range b.tableMap.ColumnName {
+		if string(name) == "action_id" {
+			actionIDColumn = i
+			break
+		}
+	}
+	if actionIDColumn < 0 {
+		return
+	}
+	for _, row := range raw.Rows {
+		if actionIDColumn >= len(row) {
+			continue
+		}
+		var id []byte
+		switch value := row[actionIDColumn].(type) {
+		case []byte:
+			id = value
+		case string:
+			id = []byte(value)
+		}
+		if len(id) == 16 {
+			b.markerActionIDs = append(b.markerActionIDs, append([]byte(nil), id...))
+		}
+	}
+}
+
+func (b *binlogIterator) lastTransactionHasAction(actionID []byte) bool {
+	for _, candidate := range b.lastMarkerActionIDs {
+		if bytes.Equal(candidate, actionID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *binlogIterator) appendChange(change core.RowChange) {
 	b.rowCount++
+	if b.current != nil {
+		b.current.RowCount = b.rowCount
+		b.recordTable(change.Table)
+	}
 	if b.tooLarge {
 		return
 	}
@@ -462,8 +572,16 @@ func (b *binlogIterator) appendChange(change core.RowChange) {
 		b.tooLarge = true
 		b.pending = nil
 		b.current.Executable = false
-		b.current.Reasons = append(b.current.Reasons, fmt.Sprintf("transaction exceeds configured limit (rows=%d bytes=%d)", b.rowCount, b.rowBytes))
 	}
+}
+
+func (b *binlogIterator) recordTable(table core.TableRef) {
+	for _, existing := range b.current.Tables {
+		if existing == table {
+			return
+		}
+	}
+	b.current.Tables = append(b.current.Tables, table)
 }
 
 func (b *binlogIterator) handleQuery(ev *replication.BinlogEvent) error {
@@ -511,6 +629,12 @@ func (b *binlogIterator) commitTransaction(ev *replication.BinlogEvent) error {
 	}
 	b.current.CommitTime = b.eventTime(ev)
 	b.current.Rows = b.pending
+	if b.tooLarge {
+		b.current.Executable = false
+		b.current.Reasons = append(b.current.Reasons, fmt.Sprintf(
+			"transaction exceeds configured limit (actual_rows=%d max_rows=%d measured_bytes_at_stop=%d max_bytes=%d)",
+			b.rowCount, b.maxRows, b.rowBytes, b.maxBytes))
+	}
 	if b.current.Executable == false && len(b.current.Reasons) == 0 {
 		b.current.Executable = true
 	}
@@ -647,6 +771,10 @@ func isSystemTable(t core.TableRef) bool {
 		return true
 	}
 	return false
+}
+
+func isActionMarkerTable(t core.TableRef) bool {
+	return t.Schema == "unredo_meta" && t.Name == "action_markers"
 }
 
 func firstLine(s string) string {

@@ -224,6 +224,10 @@ func cloneRow(row core.Row) core.Row {
 	for i, value := range row.Values {
 		out.Values[i] = value
 		out.Values[i].Data = append(core.RawJSON(nil), value.Data...)
+		if value.Native != nil {
+			native := *value.Native
+			out.Values[i].Native = &native
+		}
 	}
 	return out
 }

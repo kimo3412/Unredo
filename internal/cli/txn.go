@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -143,7 +144,7 @@ func runTxnListTable(cmd *cobra.Command, iter ports.TransactionIterator, _ *conf
 		fmt.Fprintf(out, "%-40s %-22s %5d %-40s %-10s\n",
 			truncate(gtid, 40),
 			txn.CommitTime.Format(time.RFC3339),
-			len(txn.Rows),
+			transactionRowCount(txn),
 			truncate(tables, 40),
 			rev,
 		)
@@ -207,7 +208,8 @@ func printTxnHuman(cmd *cobra.Command, txn *core.Transaction, showValues bool) e
 	fmt.Fprintf(out, "Instance:       %s\n", txn.Ref.InstanceID)
 	fmt.Fprintf(out, "Start:          %s\n", txn.StartTime.Format("2006-01-02T15:04:05Z"))
 	fmt.Fprintf(out, "Commit:         %s\n", txn.CommitTime.Format("2006-01-02T15:04:05Z"))
-	fmt.Fprintf(out, "Rows:           %d\n", len(txn.Rows))
+	fmt.Fprintf(out, "Rows:           %d\n", transactionRowCount(txn))
+	fmt.Fprintf(out, "Tables:         %s\n", distinctTables(txn))
 	fmt.Fprintf(out, "Reversible:     %s\n", yesNo(txn.Executable))
 	if len(txn.Reasons) > 0 {
 		fmt.Fprintf(out, "Reasons:\n")
@@ -234,6 +236,13 @@ func printTxnHuman(cmd *cobra.Command, txn *core.Transaction, showValues bool) e
 }
 
 func distinctTables(t *core.Transaction) string {
+	if len(t.Tables) > 0 {
+		parts := make([]string, 0, len(t.Tables))
+		for _, table := range t.Tables {
+			parts = append(parts, table.String())
+		}
+		return strings.Join(parts, ",")
+	}
 	seen := map[core.TableRef]bool{}
 	parts := []string{}
 	for _, r := range t.Rows {
@@ -251,6 +260,13 @@ func distinctTables(t *core.Transaction) string {
 		out += p
 	}
 	return out
+}
+
+func transactionRowCount(txn *core.Transaction) int {
+	if txn.RowCount > 0 {
+		return txn.RowCount
+	}
+	return len(txn.Rows)
 }
 
 func firstWord(s string) string {

@@ -68,6 +68,13 @@ func (i *Inspector) Fingerprint(ctx context.Context, t core.TableRef) (core.Sche
 	if err != nil {
 		return "", err
 	}
+	return FingerprintSchema(schema), nil
+}
+
+// FingerprintSchema hashes an already-inspected schema. Callers that must
+// inspect many rows from one table can cache the schema without opening a new
+// information_schema connection for every row.
+func FingerprintSchema(schema core.TableSchema) core.SchemaFingerprint {
 	h := sha256.New()
 	fmt.Fprintf(h, "table=%s.%s\n", schema.Table.Schema, schema.Table.Name)
 	fmt.Fprintf(h, "engine=%s\n", schema.Engine)
@@ -91,7 +98,7 @@ func (i *Inspector) Fingerprint(ctx context.Context, t core.TableRef) (core.Sche
 	for _, k := range keys {
 		fmt.Fprintf(h, "key=%s|primary=%t|cols=%s\n", k.Name, k.IsPrimary, strings.Join(k.Columns, ","))
 	}
-	return core.SchemaFingerprint("sha256:" + hex.EncodeToString(h.Sum(nil))), nil
+	return core.SchemaFingerprint("sha256:" + hex.EncodeToString(h.Sum(nil)))
 }
 
 func readEngine(ctx context.Context, db *sql.DB, t core.TableRef) (string, error) {

@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/girimi/unredo/internal/buildinfo"
 )
 
 // NewRoot returns the top-level command. All subcommands hang off this.
@@ -16,7 +18,9 @@ func NewRoot() *cobra.Command {
 		Short:         "Generate safe compensation plans from MySQL ROW binlog",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		Version:       buildinfo.Version,
 	}
+	root.SetVersionTemplate("unredo {{.Version}}\n")
 	root.PersistentFlags().String("config", "", "path to unredo.yaml (default: ./unredo.yaml)")
 	root.PersistentFlags().String("profile", "default", "profile name from the config file")
 	root.PersistentFlags().String("format", "table", "output format: table|json")
@@ -27,6 +31,7 @@ func NewRoot() *cobra.Command {
 	for _, c := range registered() {
 		root.AddCommand(c)
 	}
+	root.AddCommand(newVersionCommand())
 	return root
 }
 

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/oklog/ulid/v2"
 
 	"github.com/girimi/unredo/internal/config"
 	"github.com/girimi/unredo/internal/planner"
@@ -175,7 +176,11 @@ func TestEndToEndPlanCreate(t *testing.T) {
 	planCheck(t, planPath, "READY")
 
 	// Now apply. The row must be removed and a marker row inserted.
-	planApply(t, planPath, planner.ShortDigest(plan.Digest), 0, true)
+	applyOutput := planApplyCapture(t, planPath, planner.ShortDigest(plan.Digest), true)
+	compensatingGTID := outputField(t, applyOutput, "gtid")
+	if compensatingGTID == "" || compensatingGTID == gtid {
+		t.Fatalf("apply did not return a distinct exact compensation GTID: source=%q compensation=%q\n%s", gtid, compensatingGTID, applyOutput)
+	}
 
 	// Re-apply must be blocked by the plan_id UNIQUE.
 	planApply(t, planPath, planner.ShortDigest(plan.Digest), 1, false)
@@ -276,6 +281,110 @@ func TestEndToEndRevertUpdateDeleteAndBinary(t *testing.T) {
 	}
 }
 
+func TestEndToEndEdgeTypeRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	if _, err := rootConn.Exec("DROP TABLE IF EXISTS unredo_shop.edge_types"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootConn.Exec(`CREATE TABLE unredo_shop.edge_types (
+		id BIGINT NOT NULL,
+		f32 FLOAT NOT NULL,
+		f64 DOUBLE NOT NULL,
+		bits BIT(64) NOT NULL,
+		choice ENUM('alpha','beta','雪') NOT NULL,
+		flags SET('red','green','蓝') NOT NULL,
+		unicode_text VARCHAR(255) CHARACTER SET utf8mb4 NOT NULL,
+		binary_text VARBINARY(32) NOT NULL,
+		nullable_text VARCHAR(32) NULL,
+		empty_text VARCHAR(32) NOT NULL,
+		ts TIMESTAMP(6) NOT NULL,
+		dt DATETIME(6) NOT NULL,
+		tm TIME(6) NOT NULL,
+		doc JSON NOT NULL,
+		amount DECIMAL(30,10) NOT NULL,
+		unsigned_value BIGINT UNSIGNED NOT NULL,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = rootConn.Exec("DROP TABLE IF EXISTS unredo_shop.edge_types") })
+	if _, err := execConn.Exec(`INSERT INTO unredo_shop.edge_types
+		(id, f32, f64, bits, choice, flags, unicode_text, binary_text,
+		 nullable_text, empty_text, ts, dt, tm, doc, amount, unsigned_value)
+		VALUES (1, ?, ?, X'FEDCBA9876543210', ?, ?, ?, ?, NULL, '', ?, ?, ?, ?, ?, ?)`,
+		"1.25", "-12345.6789012345", "雪", "red,蓝", "雪🚀e\u0301", []byte{0, 1, 0xff, 0x7f},
+		"2026-01-02 03:04:05.123456", "2040-06-07 08:09:10.654321", "-12:34:56.654321",
+		`{"z":1,"a":"1","nested":{"b":true,"a":null}}`, "-12345678901234567890.1234567890", "18446744073709551615"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := execConn.Exec(`UPDATE unredo_shop.edge_types SET
+		f32=?, f64=?, bits=X'0123456789ABCDEF', choice='beta', flags='green',
+		unicode_text='changed', binary_text=X'102030', nullable_text='', empty_text='nonempty',
+		ts='2027-02-03 04:05:06.000001', dt='2041-07-08 09:10:11.000002', tm='23:59:59.999999',
+		doc='{"a":1,"z":"1"}', amount='1.0000000001', unsigned_value='42'
+		WHERE id=1`, "3.5", "98765.4321098765"); err != nil {
+		t.Fatal(err)
+	}
+	gtid, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := createPlanForGTID(t, rootConn, gtid)
+	plan, err := planner.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planApply(t, planPath, planner.ShortDigest(plan.Digest), 0, true)
+
+	var (
+		f32, f64, bits, choice, flags, unicodeText, binaryText string
+		nullableText                                           sql.NullString
+		emptyText, ts, dt, tm, doc, amount, unsignedValue      string
+	)
+	err = execConn.QueryRow(`SELECT
+		CAST(f32 AS CHAR), CAST(f64 AS CHAR), HEX(bits), choice, flags, unicode_text, HEX(binary_text),
+		nullable_text, empty_text,
+		DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(dt, '%Y-%m-%d %H:%i:%s.%f'),
+		CAST(tm AS CHAR), CAST(doc AS CHAR), CAST(amount AS CHAR), CAST(unsigned_value AS CHAR)
+		FROM unredo_shop.edge_types WHERE id=1`).Scan(
+		&f32, &f64, &bits, &choice, &flags, &unicodeText, &binaryText,
+		&nullableText, &emptyText, &ts, &dt, &tm, &doc, &amount, &unsignedValue,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f32 != "1.25" || f64 != "-12345.6789012345" || bits != "FEDCBA9876543210" ||
+		choice != "雪" || flags != "red,蓝" || unicodeText != "雪🚀e\u0301" || binaryText != "0001FF7F" ||
+		nullableText.Valid || emptyText != "" || ts != "2026-01-02 03:04:05.123456" ||
+		dt != "2040-06-07 08:09:10.654321" || tm != "-12:34:56.654321" ||
+		amount != "-12345678901234567890.1234567890" || unsignedValue != "18446744073709551615" {
+		t.Fatalf("edge types did not round-trip: f32=%q f64=%q bits=%q choice=%q flags=%q unicode=%q binary=%q nullable=%#v empty=%q ts=%q dt=%q tm=%q amount=%q unsigned=%q doc=%q",
+			f32, f64, bits, choice, flags, unicodeText, binaryText, nullableText, emptyText, ts, dt, tm, amount, unsignedValue, doc)
+	}
+	var jsonA, jsonZ, nestedB, nestedA string
+	if err := execConn.QueryRow(`SELECT
+		JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a')),
+		JSON_UNQUOTE(JSON_EXTRACT(doc, '$.z')),
+		JSON_UNQUOTE(JSON_EXTRACT(doc, '$.nested.b')),
+		JSON_TYPE(JSON_EXTRACT(doc, '$.nested.a'))
+		FROM unredo_shop.edge_types WHERE id=1`).Scan(&jsonA, &jsonZ, &nestedB, &nestedA); err != nil {
+		t.Fatal(err)
+	}
+	if jsonA != "1" || jsonZ != "1" || nestedB != "true" || nestedA != "NULL" {
+		t.Fatalf("JSON semantic round-trip failed: a=%q z=%q nested.b=%q nested.a=%q doc=%q", jsonA, jsonZ, nestedB, nestedA, doc)
+	}
+}
+
 func TestApplyConflictLeavesAllRowsUntouched(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")
@@ -339,6 +448,65 @@ func TestApplyConflictLeavesAllRowsUntouched(t *testing.T) {
 	}
 }
 
+func TestOversizeTransactionRemainsPreviewableButCannotCreatePlan(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	mysqlBin := findMySQLBin(t)
+	rootConn := openRoot(t, mysqlBin)
+	defer rootConn.Close()
+	ensureFullRowMetadata(t, rootConn)
+	execConn := openExecutor(t, mysqlBin)
+	defer execConn.Close()
+
+	binlogFile, err := readCurrentBinlogFile(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := fmt.Sprintf("large-%d", time.Now().UnixNano()%100000000)
+	tx, err := execConn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement, err := tx.Prepare("INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (?, ?, ?)")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	for i := 0; i < 1001; i++ {
+		if _, err := statement.Exec(996000+i, marker, "1.00"); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	_ = statement.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE status = ?", marker) })
+	gtid, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preview := runCLI(t, true,
+		"txn", "show", "--binlog", binlogFile, "--from-pos", "4", "--txn", gtid,
+	)
+	for _, want := range []string{"Rows:           1001", "Reversible:     no", "actual_rows=1001", "unredo_shop.orders"} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("oversize preview missing %q:\n%s", want, preview)
+		}
+	}
+	createOutput := runCLI(t, false,
+		"plan", "create", "--binlog", binlogFile, "--from-pos", "4", "--txn", gtid,
+		"--output", filepath.Join(t.TempDir(), "must-not-exist.json"),
+	)
+	if !strings.Contains(createOutput, "transaction is not executable") {
+		t.Fatalf("oversize transaction was not rejected by planner:\n%s", createOutput)
+	}
+}
+
 func TestEndToEndRevertThenReapply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")
@@ -390,6 +558,20 @@ func TestEndToEndRevertThenReapply(t *testing.T) {
 	if revertAction.RootPlanDigest != rootPlan.Digest || revertAction.PlanDigest != rootPlan.Digest {
 		t.Fatalf("revert marker digest mismatch: %+v", revertAction)
 	}
+	verifyCommitted := runCLI(t, true,
+		"action", "verify", "--action-id", revertActionID,
+		"--plan", rootPlanPath, "--wait", "0s",
+	)
+	if !strings.Contains(verifyCommitted, "status:      COMMITTED") {
+		t.Fatalf("action verify did not report COMMITTED:\n%s", verifyCommitted)
+	}
+	verifyMissing := runCLI(t, true,
+		"action", "verify", "--action-id", ulid.Make().String(),
+		"--plan", rootPlanPath, "--wait", "0s",
+	)
+	if !strings.Contains(verifyMissing, "status:      NOT_COMMITTED") {
+		t.Fatalf("action verify did not report NOT_COMMITTED:\n%s", verifyMissing)
+	}
 
 	reapplyPath := filepath.Join(t.TempDir(), "reapply.json")
 	runCLI(t, true,
@@ -423,15 +605,107 @@ func TestEndToEndRevertThenReapply(t *testing.T) {
 	if reapplyAction.ParentActionID != revertActionID || reapplyAction.RootPlanDigest != rootPlan.Digest || reapplyAction.PlanDigest != reapplyPlan.Digest {
 		t.Fatalf("reapply marker chain mismatch: %+v", reapplyAction)
 	}
+	verifyMismatch := runCLI(t, false,
+		"action", "verify", "--action-id", reapplyActionID,
+		"--plan", rootPlanPath, "--wait", "0s",
+	)
+	if !strings.Contains(verifyMismatch, "status:      INDETERMINATE") {
+		t.Fatalf("mismatched verification did not report INDETERMINATE:\n%s", verifyMismatch)
+	}
 
-	// A reapply action is a terminal state for this command: it cannot be
-	// fed back into action reapply to create an unbounded same-direction chain.
+	// Same-direction generation is forbidden: ORIGINAL_APPLIED can only move
+	// to a chained revert.
 	runCLI(t, false,
 		"action", "reapply",
 		"--action-id", reapplyActionID,
 		"--root-plan", rootPlanPath,
 		"--output", filepath.Join(t.TempDir(), "must-not-exist.json"),
 	)
+
+	chainedRevertPath := filepath.Join(t.TempDir(), "chained-revert.json")
+	runCLI(t, true,
+		"action", "revert",
+		"--action-id", reapplyActionID,
+		"--root-plan", rootPlanPath,
+		"--output", chainedRevertPath,
+	)
+	chainedRevertPlan, err := planner.ReadFile(chainedRevertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chainedRevertPlan.Mode != planner.ModeRevert || chainedRevertPlan.ParentActionID != reapplyActionID || chainedRevertPlan.RootPlanDigest != rootPlan.Digest || chainedRevertPlan.ChainDepth != 2 {
+		t.Fatalf("unexpected chained revert plan: %+v", chainedRevertPlan)
+	}
+	planCheck(t, chainedRevertPath, "READY")
+	chainedRevertOutput := planApplyCapture(t, chainedRevertPath, planner.ShortDigest(chainedRevertPlan.Digest), true)
+	chainedRevertActionID := outputField(t, chainedRevertOutput, "action_id")
+	if err := execConn.QueryRow("SELECT COUNT(*) FROM unredo_shop.orders WHERE id = ?", rowID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("chained revert left row %d present", rowID)
+	}
+	chainedRevertAction := actionShow(t, chainedRevertActionID)
+	if chainedRevertAction.ActionType != "REVERT" || chainedRevertAction.TargetState != "ORIGINAL_REVERTED" || chainedRevertAction.ChainDepth != 2 || chainedRevertAction.ParentActionID != reapplyActionID {
+		t.Fatalf("unexpected chained revert marker: %+v", chainedRevertAction)
+	}
+
+	secondReapplyPath := filepath.Join(t.TempDir(), "second-reapply.json")
+	runCLI(t, true,
+		"action", "reapply",
+		"--action-id", chainedRevertActionID,
+		"--root-plan", rootPlanPath,
+		"--output", secondReapplyPath,
+	)
+	secondReapplyPlan, err := planner.ReadFile(secondReapplyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondReapplyPlan.Mode != planner.ModeReapply || secondReapplyPlan.ParentActionID != chainedRevertActionID || secondReapplyPlan.RootPlanDigest != rootPlan.Digest || secondReapplyPlan.ChainDepth != 3 {
+		t.Fatalf("unexpected second reapply plan: %+v", secondReapplyPlan)
+	}
+	planCheck(t, secondReapplyPath, "READY")
+	secondReapplyOutput := planApplyCapture(t, secondReapplyPath, planner.ShortDigest(secondReapplyPlan.Digest), true)
+	secondReapplyActionID := outputField(t, secondReapplyOutput, "action_id")
+	if err := execConn.QueryRow("SELECT status, amount FROM unredo_shop.orders WHERE id = ?", rowID).Scan(&gotMarker, &gotAmount); err != nil {
+		t.Fatalf("read second reapplied row: %v", err)
+	}
+	if gotMarker != marker || gotAmount != "42.50" {
+		t.Fatalf("second reapply restored status=%q amount=%q", gotMarker, gotAmount)
+	}
+	secondReapplyAction := actionShow(t, secondReapplyActionID)
+	if secondReapplyAction.ActionType != "REAPPLY" || secondReapplyAction.TargetState != "ORIGINAL_APPLIED" || secondReapplyAction.ChainDepth != 3 || secondReapplyAction.ParentActionID != chainedRevertActionID {
+		t.Fatalf("unexpected second reapply marker: %+v", secondReapplyAction)
+	}
+	verifySecondReapply := runCLI(t, true,
+		"action", "verify", "--action-id", secondReapplyActionID,
+		"--plan", secondReapplyPath, "--wait", "0s",
+	)
+	if !strings.Contains(verifySecondReapply, "status:      COMMITTED") {
+		t.Fatalf("second reapply verification failed:\n%s", verifySecondReapply)
+	}
+
+	// The old depth-1 reapply is no longer the latest action and cannot fork
+	// a second successful depth-2 branch.
+	runCLI(t, false,
+		"action", "revert",
+		"--action-id", reapplyActionID,
+		"--root-plan", rootPlanPath,
+		"--output", filepath.Join(t.TempDir(), "stale-branch.json"),
+	)
+
+	// A profile-level hard limit terminates an otherwise valid alternating
+	// chain before a depth-4 plan can even be written.
+	limitedConfig := writeIntegrationConfig(t, "127.0.0.1:3306", 3)
+	limitOutput, limitErr := runCLIWithConfig(t, limitedConfig,
+		"action", "revert",
+		"--action-id", secondReapplyActionID,
+		"--root-plan", rootPlanPath,
+		"--output", filepath.Join(t.TempDir(), "over-depth.json"),
+	)
+	if limitErr == nil || !strings.Contains(limitOutput, "exceeds configured max_action_depth 3") {
+		t.Fatalf("max_action_depth did not stop chain: err=%v\n%s", limitErr, limitOutput)
+	}
 }
 
 func TestEndToEndResolveOverwriteRequiresRiskConfirmation(t *testing.T) {
@@ -850,22 +1124,11 @@ func openExecutor(t *testing.T, _ string) *sql.DB {
 	return db
 }
 
-// findMySQLBin returns the path to the bundled mysql client. The test
-// uses the client to format queries the same way the manual workflow
-// does, avoiding subtle DSN differences.
+// findMySQLBin is retained until the helper signatures are simplified.
+// Database access uses database/sql, so a local mysql CLI is not required
+// and must never cause the integration suite to skip.
 func findMySQLBin(t *testing.T) string {
 	t.Helper()
-	for _, p := range []string{
-		`D:\tool\mysql\bin\mysql.exe`,
-		`C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe`,
-		`/usr/bin/mysql`,
-		`/usr/local/mysql/bin/mysql`,
-	} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	t.Skip("no mysql client found; install MySQL 8 client or set UNREDO_MYSQL_BIN")
 	return ""
 }
 

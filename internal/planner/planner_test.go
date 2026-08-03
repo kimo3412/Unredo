@@ -143,6 +143,44 @@ func TestBuildReapplyUsesRevertedPrimaryKeyForPKChangingUpdate(t *testing.T) {
 	}
 }
 
+func TestBuildChainedRevertReusesRootDirectionAndAdvancesChain(t *testing.T) {
+	root := &Plan{
+		FormatVersion:      FormatVersion,
+		PlanID:             "01K1TEST000000000000000005",
+		Mode:               ModeRevert,
+		ExecutionClass:     ClassSafe,
+		Source:             sampleTxn(t, nil).Ref,
+		SchemaFingerprints: map[string]string{"unredo_shop.orders": "sha256:abc"},
+		Operations: []ports.PlanOperation{
+			{Sequence: 1, Table: sampleOrdersSchema().Table, Kind: core.OpUpdate, Key: idRow(8), Expect: orderWithID(8), Write: orderWithID(7)},
+			{Sequence: 2, Table: sampleOrdersSchema().Table, Kind: core.OpDelete, Key: idRow(9), Expect: orderWithID(9)},
+		},
+	}
+	root.Digest = computeDigest(root)
+
+	child, err := BuildChainedRevert(root, "01K1TEST000000000000000006", 1, "test-child")
+	if err != nil {
+		t.Fatalf("BuildChainedRevert: %v", err)
+	}
+	if child.Mode != ModeRevert || child.RootPlanDigest != root.Digest || child.ChainDepth != 2 {
+		t.Fatalf("unexpected chain metadata: mode=%s root=%s depth=%d", child.Mode, child.RootPlanDigest, child.ChainDepth)
+	}
+	if child.ParentActionID != "01K1TEST000000000000000006" || len(child.Operations) != len(root.Operations) {
+		t.Fatalf("unexpected parent or operation count")
+	}
+	if child.Operations[0].Kind != core.OpUpdate || child.Operations[1].Kind != core.OpDelete {
+		t.Fatalf("chained revert changed root operation direction/order")
+	}
+	if recomputeDigest(t, child) != child.Digest {
+		t.Fatal("child digest is not stable")
+	}
+
+	child.Operations[0].Key.Columns[0] = "mutated"
+	if root.Operations[0].Key.Columns[0] == "mutated" {
+		t.Fatal("chained plan shares mutable row storage with root plan")
+	}
+}
+
 func TestPlanDigestIsStable(t *testing.T) {
 	txn := sampleTxn(t, []core.RowChange{
 		mkRow(1, core.OpInsert, core.Row{}, sampleOrders()),
@@ -328,6 +366,19 @@ func depsFor(t *testing.T, sch core.TableSchema) Deps {
 func jsonRaw(v interface{}) core.RawJSON {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func TestCanonicalJSONPreservesArbitraryPrecisionInteger(t *testing.T) {
+	input := struct {
+		Value core.RawJSON `json:"value"`
+	}{Value: core.RawJSON(`18446744073709551615`)}
+	raw, err := canonicalJSON(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"value":18446744073709551615}` {
+		t.Fatalf("canonical JSON lost integer precision: %s", raw)
+	}
 }
 
 func ptr(s string) *core.NativeType { n := core.NativeType(s); return &n }

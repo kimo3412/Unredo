@@ -8,6 +8,7 @@
 package planner
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -107,9 +108,41 @@ func BuildReapply(root *Plan, parentActionID string, parentDepth uint32, toolVer
 		ExecutionClass:     ClassSafe,
 		CreatedAt:          time.Now().UTC(),
 		ToolVersion:        toolVersion,
-		Source:             root.Source,
+		Source:             cloneTransactionRef(root.Source),
 		SchemaFingerprints: cloneStringMap(root.SchemaFingerprints),
 		Operations:         ops,
+		BackendExtensions:  cloneRawMap(root.BackendExtensions),
+		RootPlanDigest:     root.Digest,
+		ParentActionID:     parentActionID,
+		ChainDepth:         parentDepth + 1,
+	}
+	p.Digest = computeDigest(p)
+	return p, nil
+}
+
+// BuildChainedRevert derives the next safe revert from the immutable root
+// plan after a successful reapply. The caller must prove that parentActionID
+// is the latest REAPPLY/ORIGINAL_APPLIED action for this root.
+func BuildChainedRevert(root *Plan, parentActionID string, parentDepth uint32, toolVersion string) (*Plan, error) {
+	if root == nil {
+		return nil, errors.New("planner: nil root plan")
+	}
+	if root.Mode != ModeRevert || root.ExecutionClass != ClassSafe {
+		return nil, fmt.Errorf("planner: chained revert requires a safe root revert plan")
+	}
+	if parentActionID == "" {
+		return nil, fmt.Errorf("planner: parent action id is required")
+	}
+	p := &Plan{
+		FormatVersion:      FormatVersion,
+		PlanID:             ulid.Make().String(),
+		Mode:               ModeRevert,
+		ExecutionClass:     ClassSafe,
+		CreatedAt:          time.Now().UTC(),
+		ToolVersion:        toolVersion,
+		Source:             cloneTransactionRef(root.Source),
+		SchemaFingerprints: cloneStringMap(root.SchemaFingerprints),
+		Operations:         cloneOperations(root.Operations),
 		BackendExtensions:  cloneRawMap(root.BackendExtensions),
 		RootPlanDigest:     root.Digest,
 		ParentActionID:     parentActionID,
@@ -125,16 +158,16 @@ func invertRevertOperation(op ports.PlanOperation) (ports.PlanOperation, error) 
 	switch op.Kind {
 	case core.OpDelete:
 		out.Kind = core.OpInsert
-		out.Write = op.Expect
+		out.Write = cloneRow(op.Expect)
 		out.Key = projectColumns(op.Expect, keyColumns)
 	case core.OpInsert:
 		out.Kind = core.OpDelete
-		out.Expect = op.Write
+		out.Expect = cloneRow(op.Write)
 		out.Key = projectColumns(op.Write, keyColumns)
 	case core.OpUpdate:
 		out.Kind = core.OpUpdate
-		out.Expect = op.Write
-		out.Write = op.Expect
+		out.Expect = cloneRow(op.Write)
+		out.Write = cloneRow(op.Expect)
 		out.Key = projectColumns(op.Write, keyColumns)
 	default:
 		return ports.PlanOperation{}, fmt.Errorf("planner: cannot invert operation %q", op.Kind)
@@ -153,7 +186,7 @@ func projectColumns(row core.Row, columns []string) core.Row {
 			out.Values = append(out.Values, value)
 		}
 	}
-	return out
+	return cloneRow(out)
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
@@ -164,6 +197,12 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
+func cloneTransactionRef(in core.TransactionRef) core.TransactionRef {
+	out := in
+	out.Cursor = append(json.RawMessage(nil), in.Cursor...)
+	return out
+}
+
 func cloneRawMap(in map[string]json.RawMessage) map[string]json.RawMessage {
 	if in == nil {
 		return nil
@@ -171,6 +210,14 @@ func cloneRawMap(in map[string]json.RawMessage) map[string]json.RawMessage {
 	out := make(map[string]json.RawMessage, len(in))
 	for k, v := range in {
 		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
+}
+
+func cloneOperations(in []ports.PlanOperation) []ports.PlanOperation {
+	out := make([]ports.PlanOperation, len(in))
+	for i, op := range in {
+		out[i] = cloneOperation(op)
 	}
 	return out
 }
@@ -531,7 +578,9 @@ func canonicalJSON(v interface{}) ([]byte, error) {
 	}
 	// Then re-parse and re-emit with sorted keys via a generic walk.
 	var generic interface{}
-	if err := json.Unmarshal(raw, &generic); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&generic); err != nil {
 		return nil, err
 	}
 	return marshalCanonical(generic)

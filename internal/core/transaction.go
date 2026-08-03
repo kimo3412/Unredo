@@ -70,14 +70,14 @@ func (r Row) Equal(other Row) bool {
 // Sequence is 0-based and reflects the original event order; revert
 // applies operations in reverse Sequence order.
 type RowChange struct {
-	Sequence       int           `json:"sequence"`
-	Table          TableRef      `json:"table"`
-	Operation      OperationKind `json:"operation"`
-	Key            Row           `json:"key"`
-	Before         Row           `json:"before"`
-	After          Row           `json:"after"`
-	SchemaColumns  []string      `json:"schema_columns,omitempty"`
-	SchemaFingerprint string     `json:"schema_fingerprint,omitempty"`
+	Sequence          int           `json:"sequence"`
+	Table             TableRef      `json:"table"`
+	Operation         OperationKind `json:"operation"`
+	Key               Row           `json:"key"`
+	Before            Row           `json:"before"`
+	After             Row           `json:"after"`
+	SchemaColumns     []string      `json:"schema_columns,omitempty"`
+	SchemaFingerprint string        `json:"schema_fingerprint,omitempty"`
 }
 
 // TransactionRef identifies a transaction in a way the core can pass around
@@ -91,11 +91,13 @@ type TransactionRef struct {
 
 // Transaction is the materialized body of one transaction.
 type Transaction struct {
-	Ref       TransactionRef `json:"ref"`
-	StartTime time.Time      `json:"start_time"`
-	CommitTime time.Time     `json:"commit_time"`
-	GTID      string         `json:"gtid,omitempty"`
-	Rows      []RowChange    `json:"rows"`
+	Ref        TransactionRef `json:"ref"`
+	StartTime  time.Time      `json:"start_time"`
+	CommitTime time.Time      `json:"commit_time"`
+	GTID       string         `json:"gtid,omitempty"`
+	RowCount   int            `json:"row_count"`
+	Tables     []TableRef     `json:"tables,omitempty"`
+	Rows       []RowChange    `json:"rows"`
 
 	// Executable reports whether the planner can turn this transaction
 	// into a safe revert/reapply plan given the backend capabilities.
@@ -123,13 +125,13 @@ type SchemaFingerprint string
 
 // ColumnDef describes one column as reported by the backend.
 type ColumnDef struct {
-	Name       string      `json:"name"`
-	Ordinal    int         `json:"ordinal"`
-	NativeType NativeType  `json:"native_type"`
-	Nullable   bool        `json:"nullable"`
-	Charset    string      `json:"charset,omitempty"`
-	Collation  string      `json:"collation,omitempty"`
-	Generated  bool        `json:"generated,omitempty"`
+	Name       string     `json:"name"`
+	Ordinal    int        `json:"ordinal"`
+	NativeType NativeType `json:"native_type"`
+	Nullable   bool       `json:"nullable"`
+	Charset    string     `json:"charset,omitempty"`
+	Collation  string     `json:"collation,omitempty"`
+	Generated  bool       `json:"generated,omitempty"`
 }
 
 // UniqueKey is an ordered set of columns that uniquely identify a row.

@@ -16,6 +16,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/girimi/unredo/internal/buildinfo"
 	"github.com/girimi/unredo/internal/core"
 	"github.com/girimi/unredo/internal/planner"
 	"github.com/girimi/unredo/internal/ports"
@@ -207,13 +208,31 @@ func runPlanApply(cmd *cobra.Command, args []string) error {
 	}
 	result, err := executor.Apply(ctx, *plan.ToPorts(), req)
 	if err != nil {
+		if errors.Is(err, ports.ErrCommitUnknown) {
+			if result.ActionID != "" {
+				actionID = result.ActionID
+			}
+			printCommitUnknownRecovery(cmd, actionID, planPath)
+		}
 		return fmt.Errorf("apply: %w", err)
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "action_id:    %s\n", actionID)
 	fmt.Fprintf(cmd.OutOrStdout(), "gtid:         %s\n", result.CompensatingGTID)
 	fmt.Fprintf(cmd.OutOrStdout(), "affected:     %d\n", result.AffectedRows)
+	if result.GTIDCorrelationWarning != "" {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: compensation committed, but exact GTID correlation failed: %s\n", result.GTIDCorrelationWarning)
+	}
 	return nil
+}
+
+func printCommitUnknownRecovery(cmd *cobra.Command, actionID, planPath string) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out, "status:       COMMIT_UNKNOWN")
+	fmt.Fprintf(out, "action_id:    %s\n", actionID)
+	fmt.Fprintf(out, "plan:         %s\n", planPath)
+	fmt.Fprintln(out, "retry:        FORBIDDEN until verification")
+	fmt.Fprintf(out, "verify:       unredo action verify --action-id %s --plan %s\n", actionID, planPath)
 }
 
 func newPlanResolveCmd() *cobra.Command {
@@ -503,8 +522,7 @@ func ensureParentDir(path string) error {
 }
 
 func toolVersion() string {
-	// Static until release packaging wires a build-time version via ldflags.
-	return "0.1.0-m3"
+	return buildinfo.Version
 }
 
 func printCheckHuman(cmd *cobra.Command, r *ports.CheckResult, showConflicts bool) {

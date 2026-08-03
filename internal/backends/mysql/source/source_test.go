@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+
+	"github.com/girimi/unredo/internal/core"
 )
 
 func TestDDLQueryEventCompletesWithoutXID(t *testing.T) {
@@ -28,5 +30,63 @@ func TestDDLQueryEventCompletesWithoutXID(t *testing.T) {
 	}
 	if iterator.current.Executable || len(iterator.current.Reasons) != 1 || !strings.Contains(iterator.current.Reasons[0], "CREATE DATABASE") {
 		t.Fatalf("unexpected DDL transaction: %+v", iterator.current)
+	}
+}
+
+func TestOversizeTransactionKeepsSummaryWithoutRowImages(t *testing.T) {
+	iterator := &binlogIterator{
+		current:  &core.Transaction{},
+		maxRows:  2,
+		maxBytes: 1 << 20,
+	}
+	table := core.TableRef{Schema: "shop", Name: "orders"}
+	for i := 0; i < 4; i++ {
+		iterator.appendChange(core.RowChange{Sequence: i + 1, Table: table, Operation: core.OpInsert})
+	}
+	if err := iterator.commitTransaction(&replication.BinlogEvent{
+		Header: &replication.EventHeader{Timestamp: 100, EventType: replication.XID_EVENT},
+		Event:  &replication.XIDEvent{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if iterator.current.RowCount != 4 || len(iterator.current.Rows) != 0 || len(iterator.current.Tables) != 1 {
+		t.Fatalf("oversize summary lost: %+v", iterator.current)
+	}
+	if iterator.current.Executable || len(iterator.current.Reasons) != 1 || !strings.Contains(iterator.current.Reasons[0], "actual_rows=4") {
+		t.Fatalf("unexpected oversize classification: %+v", iterator.current)
+	}
+}
+
+func TestActionMarkerIsCapturedWithoutBecomingAPlannableRow(t *testing.T) {
+	iterator := &binlogIterator{instanceID: "server-uuid"}
+	marker := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	tableMap := &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.TABLE_MAP_EVENT},
+		Event: &replication.TableMapEvent{
+			TableID:    42,
+			Schema:     []byte("unredo_meta"),
+			Table:      []byte("action_markers"),
+			ColumnName: [][]byte{[]byte("action_id"), []byte("plan_id")},
+		},
+	}
+	if err := iterator.handleEvent(tableMap); err != nil {
+		t.Fatal(err)
+	}
+	rows := &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2},
+		Event: &replication.RowsEvent{
+			TableID: 42,
+			Rows:    [][]interface{}{{marker, []byte("plan")}},
+		},
+	}
+	if err := iterator.handleEvent(rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(iterator.pending) != 0 || len(iterator.markerActionIDs) != 1 {
+		t.Fatalf("marker handling leaked into rows: pending=%d markers=%d", len(iterator.pending), len(iterator.markerActionIDs))
+	}
+	iterator.lastMarkerActionIDs = iterator.markerActionIDs
+	if !iterator.lastTransactionHasAction(marker) {
+		t.Fatal("captured marker cannot be matched")
 	}
 }

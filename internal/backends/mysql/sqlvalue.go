@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/girimi/unredo/internal/core"
@@ -25,12 +27,42 @@ func driverValue(v core.Value) (interface{}, error) {
 		return string(v.Data), nil
 	case core.KindDecimal, core.KindFloat, core.KindText, core.KindEnum,
 		core.KindSet, core.KindDate, core.KindTime, core.KindDateTime,
-		core.KindJSON, core.KindBit:
+		core.KindJSON:
 		var s string
 		if err := json.Unmarshal(v.Data, &s); err != nil {
 			return nil, fmt.Errorf("decode %s value: %w", v.Kind, err)
 		}
 		return s, nil
+	case core.KindBit:
+		var s string
+		if err := json.Unmarshal(v.Data, &s); err != nil {
+			return nil, fmt.Errorf("decode bit value: %w", err)
+		}
+		n := new(big.Int)
+		if _, ok := n.SetString(s, 10); !ok || n.Sign() < 0 {
+			return nil, fmt.Errorf("decode bit value: invalid unsigned integer %q", s)
+		}
+		width := n.BitLen()
+		if v.Native != nil {
+			native := strings.ToLower(strings.TrimSpace(string(*v.Native)))
+			if strings.HasPrefix(native, "bit(") && strings.HasSuffix(native, ")") {
+				parsed, err := strconv.Atoi(native[4 : len(native)-1])
+				if err != nil || parsed < 1 || parsed > 64 {
+					return nil, fmt.Errorf("decode bit value: invalid native type %q", native)
+				}
+				width = parsed
+			}
+		}
+		if n.BitLen() > width {
+			return nil, fmt.Errorf("decode bit value: %q exceeds BIT(%d)", s, width)
+		}
+		byteLen := (width + 7) / 8
+		if byteLen == 0 {
+			byteLen = 1
+		}
+		out := make([]byte, byteLen)
+		n.FillBytes(out)
+		return out, nil
 	case core.KindBinary:
 		var encoded string
 		if err := json.Unmarshal(v.Data, &encoded); err != nil {
@@ -48,6 +80,18 @@ func driverValue(v core.Value) (interface{}, error) {
 
 func quoteIdent(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// parameterExpression gives MySQL an explicit native type when a plain
+// string parameter would otherwise have different comparison or assignment
+// semantics.
+func parameterExpression(v core.Value) string {
+	switch v.Kind {
+	case core.KindJSON:
+		return "CAST(? AS JSON)"
+	default:
+		return "?"
+	}
 }
 
 // buildPredicate renders exact SQL predicates with correct NULL semantics.
@@ -75,7 +119,12 @@ func buildPredicate(rows ...core.Row) (string, []interface{}, error) {
 			if err != nil {
 				return "", nil, fmt.Errorf("column %q: %w", col, err)
 			}
-			parts = append(parts, quoteIdent(col)+" = ?")
+			columnExpression := quoteIdent(col)
+			if v.Kind == core.KindBit {
+				columnExpression = "CAST(" + columnExpression + " AS BINARY)"
+			}
+			predicate := columnExpression + " = " + parameterExpression(v)
+			parts = append(parts, predicate)
 			args = append(args, arg)
 		}
 	}

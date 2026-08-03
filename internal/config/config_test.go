@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,5 +29,17 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if profile.Source.ServerID != 12345 || profile.Source.PasswordEnv != "READER_PASSWORD" || profile.Target.PasswordEnv != "EXECUTOR_PASSWORD" {
 		t.Fatalf("round trip changed profile: %+v", profile)
+	}
+}
+
+func TestProfileRejectsNegativeSafetyLimit(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.MaxTransactionRows = -1
+	config := &Config{Version: Version, Profiles: map[string]Profile{
+		"unsafe": {Backend: "mysql", Policy: policy},
+	}}
+	_, err := config.Profile("unsafe")
+	if err == nil || !strings.Contains(err.Error(), "max_transaction_rows must be positive") {
+		t.Fatalf("expected negative limit rejection, got %v", err)
 	}
 }

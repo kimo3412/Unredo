@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate release tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must be semantic version form vX.Y.Z or vX.Y.Z-prerelease"
+            exit 1
+          fi
+          if [ "${#VERSION}" -gt 33 ]; then
+            echo "release version exceeds the 32-character audit field"
+            exit 1
+          fi
+      - name: Verify
+        run: |
+          go test ./...
+          go vet ./...
+          go vet -tags=integration ./...
+      - name: Run MySQL integration gate
+        run: |
+          docker run -d --name unredo-mysql -e MYSQL_ROOT_PASSWORD=123456 -p 3306:3306 mysql:8.4 \
+            --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL \
+            --binlog-row-metadata=FULL --gtid-mode=ON --enforce-gtid-consistency=ON
+          for attempt in $(seq 1 60); do
+            if docker exec unredo-mysql mysqladmin ping -h127.0.0.1 -uroot -p123456 --silent; then break; fi
+            if [ "$attempt" = 60 ]; then docker logs unredo-mysql; exit 1; fi
+            sleep 2
+          done
+          docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/setup_test_users.sql
+          docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/init_m0_schema.sql
+          docker exec -i unredo-mysql mysql -uroot -p123456 < scripts/seed_fixtures.sql
+          go build -o bin/unredo.exe ./cmd/unredo
+          go test -tags=integration -count=1 -timeout 300s ./tests/integration
+      - name: Build archives
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          build_date="$(git show -s --format=%cI "$COMMIT")"
+          mkdir -p dist stage
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="unredo_${version}_${goos}_${goarch}"
+            binary="unredo"
+            if [ "$goos" = windows ]; then binary="unredo.exe"; fi
+            rm -rf stage/*
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+              -ldflags "-s -w -X github.com/girimi/unredo/internal/buildinfo.Version=$version -X github.com/girimi/unredo/internal/buildinfo.Commit=$COMMIT -X github.com/girimi/unredo/internal/buildinfo.BuildDate=$build_date" \
+              -o "stage/$binary" ./cmd/unredo
+            cp README.md stage/
+            if [ "$goos" = windows ]; then
+              (cd stage && zip -q "../dist/${name}.zip" "$binary" README.md)
+            else
+              tar -C stage -czf "dist/${name}.tar.gz" "$binary" README.md
+            fi
+          done
+          (cd dist && sha256sum * > checksums.txt)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes

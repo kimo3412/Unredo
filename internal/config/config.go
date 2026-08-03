@@ -100,8 +100,8 @@ type Config struct {
 	Profiles map[string]Profile `yaml:"profiles"`
 }
 
-// DefaultPolicy returns a conservative policy matching the M0 placeholder
-// values in DESIGN.md §11. Final values must come from M0 benchmarks.
+// DefaultPolicy returns the conservative limits validated by the real MySQL
+// large-transaction benchmark documented in README.md.
 func DefaultPolicy() Policy {
 	return Policy{
 		RequireGTID:         true,
@@ -143,6 +143,9 @@ func (c *Config) Profile(name string) (*Profile, error) {
 		if pp.Policy.MaxTransactionRows == 0 {
 			pp.Policy = mergePolicy(pp.Policy, DefaultPolicy())
 		}
+		if err := validatePolicy(pp.Policy); err != nil {
+			return nil, fmt.Errorf("profile %q: %w", name, err)
+		}
 		return &pp, nil
 	}
 	names := make([]string, 0, len(c.Profiles))
@@ -150,6 +153,22 @@ func (c *Config) Profile(name string) (*Profile, error) {
 		names = append(names, k)
 	}
 	return nil, fmt.Errorf("profile %q not found; available: %v", name, names)
+}
+
+func validatePolicy(policy Policy) error {
+	switch {
+	case policy.MaxTransactionRows <= 0:
+		return fmt.Errorf("max_transaction_rows must be positive")
+	case policy.MaxTransactionBytes <= 0:
+		return fmt.Errorf("max_transaction_bytes must be positive")
+	case policy.MaxPlanBytes <= 0:
+		return fmt.Errorf("max_plan_bytes must be positive")
+	case policy.MaxActionDepth <= 0:
+		return fmt.Errorf("max_action_depth must be positive")
+	case policy.LockWaitTimeout <= 0:
+		return fmt.Errorf("lock_wait_timeout must be positive")
+	}
+	return nil
 }
 
 func mergePolicy(a, b Policy) Policy {

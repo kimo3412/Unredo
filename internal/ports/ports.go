@@ -126,9 +126,10 @@ type PlanOperation struct {
 
 // ExecutionResult is the outcome of Apply.
 type ExecutionResult struct {
-	CompensatingGTID string `json:"compensating_gtid,omitempty"`
-	AffectedRows     int    `json:"affected_rows"`
-	ActionID         string `json:"action_id,omitempty"`
+	CompensatingGTID       string `json:"compensating_gtid,omitempty"`
+	GTIDCorrelationWarning string `json:"gtid_correlation_warning,omitempty"`
+	AffectedRows           int    `json:"affected_rows"`
+	ActionID               string `json:"action_id,omitempty"`
 }
 
 // ApplyRequest is the per-invocation state an executor needs that is
@@ -161,6 +162,28 @@ type Action struct {
 type ActionStore interface {
 	FindAction(ctx context.Context, actionID string) (*Action, error)
 	LatestAction(ctx context.Context, rootPlanDigest string) (*Action, error)
+}
+
+// TargetIdentifier exposes the concrete execution target identity used to
+// prevent an absence check against the wrong instance.
+type TargetIdentifier interface {
+	TargetInstanceID() string
+}
+
+type ActionVerificationStatus string
+
+const (
+	ActionCommitted     ActionVerificationStatus = "COMMITTED"
+	ActionNotCommitted  ActionVerificationStatus = "NOT_COMMITTED"
+	ActionIndeterminate ActionVerificationStatus = "INDETERMINATE"
+)
+
+type ActionVerification struct {
+	Status   ActionVerificationStatus `json:"status"`
+	ActionID string                   `json:"action_id"`
+	PlanID   string                   `json:"plan_id"`
+	Message  string                   `json:"message"`
+	Action   *Action                  `json:"action,omitempty"`
 }
 
 // PlanExecutor checks and applies plans against the target database.

@@ -23,29 +23,41 @@ import (
 
 // CheckReader is the executor.Reader that targets a MySQL instance.
 type CheckReader struct {
-	targetDSN  string
 	instanceID string
 	inspector  *schema.Inspector
+	db         *sql.DB
+	dbErr      error
+	schemas    map[core.TableRef]core.TableSchema
 }
 
 // NewCheckReader wires a reader to the target DSN. The instance id is
 // used to detect SOURCE_MISMATCH at check time.
 func NewCheckReader(targetDSN, instanceID string) *CheckReader {
+	db, dbErr := sql.Open("mysql", targetDSN)
+	if dbErr == nil {
+		db.SetMaxOpenConns(4)
+		db.SetMaxIdleConns(4)
+	}
 	return &CheckReader{
-		targetDSN:  targetDSN,
 		instanceID: instanceID,
 		inspector:  schema.NewInspector(targetDSN),
+		db:         db,
+		dbErr:      dbErr,
+		schemas:    make(map[core.TableRef]core.TableSchema),
 	}
 }
 
 // NewCheckReaderFromBackend pulls the target DSN and instance id out
 // of a Backend, avoiding a redundant ping in the CLI.
 func NewCheckReaderFromBackend(b *Backend) *CheckReader {
-	return &CheckReader{
-		targetDSN:  b.targetDSN,
-		instanceID: b.targetInstanceID,
-		inspector:  schema.NewInspector(b.targetDSN),
+	return NewCheckReader(b.targetDSN, b.targetInstanceID)
+}
+
+func (r *CheckReader) Close() error {
+	if r.db == nil {
+		return nil
 	}
+	return r.db.Close()
 }
 
 // TargetInstanceID implements executor.Reader.
@@ -53,15 +65,22 @@ func (r *CheckReader) TargetInstanceID() string { return r.instanceID }
 
 // Fingerprint implements executor.Reader.
 func (r *CheckReader) Fingerprint(ctx context.Context, t core.TableRef) (core.SchemaFingerprint, error) {
-	return r.inspector.Fingerprint(ctx, t)
+	sch, err := r.schemaFor(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	return schema.FingerprintSchema(sch), nil
 }
 
 // ReadByKey implements executor.Reader.
 func (r *CheckReader) ReadByKey(ctx context.Context, t core.TableRef, keyColumns []string, key core.Row) (executor.Row, bool, error) {
+	if r.dbErr != nil {
+		return executor.Row{}, false, fmt.Errorf("mysql: open: %w", r.dbErr)
+	}
 	if len(keyColumns) == 0 {
 		return executor.Row{}, false, fmt.Errorf("mysql: empty key columns for %s", t)
 	}
-	sch, err := r.inspector.InspectTable(ctx, t)
+	sch, err := r.schemaFor(ctx, t)
 	if err != nil {
 		return executor.Row{}, false, err
 	}
@@ -102,12 +121,7 @@ func (r *CheckReader) ReadByKey(ctx context.Context, t core.TableRef, keyColumns
 		" WHERE " + where +
 		" LIMIT 1"
 
-	db, err := sql.Open("mysql", r.targetDSN)
-	if err != nil {
-		return executor.Row{}, false, fmt.Errorf("mysql: open: %w", err)
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(ctx, query, args...)
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return executor.Row{}, false, fmt.Errorf("mysql: query: %w", err)
 	}
@@ -138,6 +152,18 @@ func (r *CheckReader) ReadByKey(ctx context.Context, t core.TableRef, keyColumns
 		return executor.Row{}, false, err
 	}
 	return rowToExecutor(coreRow), true, nil
+}
+
+func (r *CheckReader) schemaFor(ctx context.Context, table core.TableRef) (core.TableSchema, error) {
+	if cached, ok := r.schemas[table]; ok {
+		return cached, nil
+	}
+	sch, err := r.inspector.InspectTable(ctx, table)
+	if err != nil {
+		return core.TableSchema{}, err
+	}
+	r.schemas[table] = sch
+	return sch, nil
 }
 
 func rowToExecutor(r core.Row) executor.Row {

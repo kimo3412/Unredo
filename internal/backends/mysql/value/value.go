@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/girimi/unredo/internal/core"
@@ -105,7 +107,22 @@ func decodeInteger(ct ColumnType, raw interface{}) (core.Value, error) {
 		s = string(x)
 	case string:
 		s = x
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+	case int64:
+		// The replication decoder can expose BIGINT UNSIGNED through an
+		// int64 container. A negative value is the original unsigned bit
+		// pattern, not a negative SQL value.
+		var integer interface{} = x
+		if x < 0 && strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct.ColumnType)), "bigint") && strings.Contains(strings.ToLower(ct.ColumnType), "unsigned") {
+			integer = uint64(x)
+		}
+		out, _ := json.Marshal(integer)
+		return core.Value{
+			Kind:     core.KindInteger,
+			Encoding: "json",
+			Data:     core.RawJSON(out),
+			Native:   ptrNative(ct.ColumnType),
+		}, nil
+	case int, int8, int16, int32, uint, uint8, uint16, uint32, uint64:
 		out, _ := json.Marshal(x)
 		return core.Value{
 			Kind:     core.KindInteger,
@@ -216,13 +233,37 @@ func parseDecimalParts(s string) (string, int, error) {
 }
 
 func decodeFloat(ct ColumnType, raw interface{}) (core.Value, error) {
-	s, ok := asString(raw)
-	if !ok {
-		return core.Value{}, fmt.Errorf("mysql: float column %q: expected string, got %T", ct.Name, raw)
+	var s string
+	bitSize := 64
+	if strings.HasPrefix(strings.ToLower(ct.ColumnType), "float") {
+		bitSize = 32
+	}
+	switch value := raw.(type) {
+	case float32:
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return core.Value{}, fmt.Errorf("mysql: float column %q: non-finite value", ct.Name)
+		}
+		s = strconv.FormatFloat(float64(value), 'g', -1, 32)
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return core.Value{}, fmt.Errorf("mysql: float column %q: non-finite value", ct.Name)
+		}
+		s = strconv.FormatFloat(value, 'g', -1, bitSize)
+	default:
+		var ok bool
+		s, ok = asString(raw)
+		if !ok {
+			return core.Value{}, fmt.Errorf("mysql: float column %q: expected text or float, got %T", ct.Name, raw)
+		}
+		s = strings.TrimSpace(s)
+		parsed, err := strconv.ParseFloat(s, bitSize)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return core.Value{}, fmt.Errorf("mysql: float column %q: invalid value %q", ct.Name, s)
+		}
 	}
 	// Preserve the textual form so that binlog image equals SQL image
 	// without binary round-trip drift.
-	data, _ := json.Marshal(strings.TrimSpace(s))
+	data, _ := json.Marshal(s)
 	return core.Value{
 		Kind:     core.KindFloat,
 		Encoding: "string",
@@ -307,14 +348,27 @@ func compactJSON(s string) string {
 }
 
 func decodeBit(ct ColumnType, raw interface{}) (core.Value, error) {
-	// BIT comes back as []byte from go-sql-driver. Use big.Int so that
-	// values wider than 64 bits round-trip exactly.
-	b, ok := asBytes(raw)
-	if !ok {
-		return core.Value{}, fmt.Errorf("mysql: bit column %q: expected []byte, got %T", ct.Name, raw)
+	// SELECT returns []byte, while the binlog decoder returns int64 even for
+	// BIT(64). Converting that signed container back to uint64 preserves the
+	// original high bit. MySQL BIT is limited to 64 bits.
+	var text string
+	switch value := raw.(type) {
+	case int64:
+		text = strconv.FormatUint(uint64(value), 10)
+	case uint64:
+		text = strconv.FormatUint(value, 10)
+	case int:
+		text = strconv.FormatUint(uint64(value), 10)
+	case uint:
+		text = strconv.FormatUint(uint64(value), 10)
+	default:
+		b, ok := asBytes(raw)
+		if !ok {
+			return core.Value{}, fmt.Errorf("mysql: bit column %q: expected bytes or integer, got %T", ct.Name, raw)
+		}
+		text = new(big.Int).SetBytes(b).String()
 	}
-	z := new(big.Int).SetBytes(b)
-	data, _ := json.Marshal(z.String())
+	data, _ := json.Marshal(text)
 	return core.Value{
 		Kind:     core.KindBit,
 		Encoding: "bigint",
@@ -324,9 +378,41 @@ func decodeBit(ct ColumnType, raw interface{}) (core.Value, error) {
 }
 
 func decodeStringish(ct ColumnType, raw interface{}, kind core.ValueKind) (core.Value, error) {
-	s, ok := asString(raw)
-	if !ok {
-		return core.Value{}, fmt.Errorf("mysql: %s column %q: expected string, got %T", kind, ct.Name, raw)
+	var s string
+	switch value := raw.(type) {
+	case int64:
+		members, err := parseStringMembers(ct.ColumnType)
+		if err != nil {
+			return core.Value{}, fmt.Errorf("mysql: %s column %q: %w", kind, ct.Name, err)
+		}
+		switch kind {
+		case core.KindEnum:
+			if value == 0 {
+				s = ""
+			} else if value < 0 || value > int64(len(members)) {
+				return core.Value{}, fmt.Errorf("mysql: enum column %q: index %d out of range", ct.Name, value)
+			} else {
+				s = members[value-1]
+			}
+		case core.KindSet:
+			mask := uint64(value)
+			if len(members) < 64 && mask>>uint(len(members)) != 0 {
+				return core.Value{}, fmt.Errorf("mysql: set column %q: mask %d has unknown bits", ct.Name, mask)
+			}
+			selected := make([]string, 0, len(members))
+			for i, member := range members {
+				if mask&(uint64(1)<<uint(i)) != 0 {
+					selected = append(selected, member)
+				}
+			}
+			s = strings.Join(selected, ",")
+		}
+	default:
+		var ok bool
+		s, ok = asString(raw)
+		if !ok {
+			return core.Value{}, fmt.Errorf("mysql: %s column %q: expected string or binlog index, got %T", kind, ct.Name, raw)
+		}
 	}
 	data, _ := json.Marshal(s)
 	return core.Value{
@@ -335,6 +421,70 @@ func decodeStringish(ct ColumnType, raw interface{}, kind core.ValueKind) (core.
 		Data:     data,
 		Native:   ptrNative(ct.ColumnType),
 	}, nil
+}
+
+func parseStringMembers(columnType string) ([]string, error) {
+	open := strings.IndexByte(columnType, '(')
+	close := strings.LastIndexByte(columnType, ')')
+	if open < 0 || close <= open {
+		return nil, fmt.Errorf("malformed native type %q", columnType)
+	}
+	body := columnType[open+1 : close]
+	var members []string
+	for pos := 0; ; {
+		for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t') {
+			pos++
+		}
+		if pos == len(body) {
+			break
+		}
+		if body[pos] != '\'' {
+			return nil, fmt.Errorf("malformed member list %q", columnType)
+		}
+		pos++
+		var member strings.Builder
+		closed := false
+		for pos < len(body) {
+			switch body[pos] {
+			case '\\':
+				pos++
+				if pos >= len(body) {
+					return nil, fmt.Errorf("trailing escape in %q", columnType)
+				}
+				member.WriteByte(body[pos])
+				pos++
+			case '\'':
+				if pos+1 < len(body) && body[pos+1] == '\'' {
+					member.WriteByte('\'')
+					pos += 2
+					continue
+				}
+				pos++
+				closed = true
+			default:
+				member.WriteByte(body[pos])
+				pos++
+			}
+			if closed {
+				break
+			}
+		}
+		if !closed {
+			return nil, fmt.Errorf("unterminated member in %q", columnType)
+		}
+		members = append(members, member.String())
+		for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t') {
+			pos++
+		}
+		if pos == len(body) {
+			break
+		}
+		if body[pos] != ',' {
+			return nil, fmt.Errorf("malformed member separator in %q", columnType)
+		}
+		pos++
+	}
+	return members, nil
 }
 
 func marshalJSON(v interface{}) (core.RawJSON, error) {

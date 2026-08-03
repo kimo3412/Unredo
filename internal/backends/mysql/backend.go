@@ -88,6 +88,10 @@ func (b *Backend) Name() string { return "mysql" }
 // InstanceID returns the MySQL @@server_uuid, used to validate plan refs.
 func (b *Backend) InstanceID() string { return b.instanceID }
 
+// TargetInstanceID is used by commit-unknown verification to prove that a
+// missing marker was queried on the exact instance named by the plan.
+func (b *Backend) TargetInstanceID() string { return b.targetInstanceID }
+
 // Capabilities implements ports.ChangeSource.
 // MySQL 8 with ROW/FULL/GTID is the assumed M0 configuration. The flags
 // reflect what the planner can rely on; schema-at-event-time is reported
@@ -122,6 +126,7 @@ func (b *Backend) Find(ctx context.Context, ref core.TransactionRef) (*core.Tran
 func (b *Backend) Check(ctx context.Context, plan ports.Plan) (*ports.CheckResult, error) {
 	reader := NewCheckReader(b.targetDSN, b.targetInstanceID)
 	result, err := executor.Check(ctx, &plan, reader)
+	_ = reader.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +172,7 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 	// Re-check the real target instance, schema and current row images now.
 	reader := NewCheckReader(b.targetDSN, b.targetInstanceID)
 	check, err := executor.Check(ctx, &plan, reader)
+	_ = reader.Close()
 	if err != nil {
 		return ports.ExecutionResult{}, fmt.Errorf("mysql: pre-apply check: %w", err)
 	}
@@ -184,7 +190,29 @@ func (b *Backend) Apply(ctx context.Context, plan ports.Plan, req ports.ApplyReq
 	if err != nil {
 		return ports.ExecutionResult{}, err
 	}
-	return writer.Apply(ctx, &plan, opts)
+	startCursor, cursorErr := b.source.CurrentCursor(ctx)
+	result, err := writer.Apply(ctx, &plan, opts)
+	if err != nil {
+		return result, err
+	}
+	if cursorErr != nil {
+		result.GTIDCorrelationWarning = cursorErr.Error()
+		return result, nil
+	}
+	actionID, err := ulidBytes(req.ActionID)
+	if err != nil {
+		result.GTIDCorrelationWarning = "invalid committed action id: " + err.Error()
+		return result, nil
+	}
+	correlationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	gtid, err := b.source.FindActionGTID(correlationCtx, startCursor, actionID)
+	if err != nil {
+		result.GTIDCorrelationWarning = err.Error()
+		return result, nil
+	}
+	result.CompensatingGTID = gtid
+	return result, nil
 }
 
 func (b *Backend) validateActionChain(ctx context.Context, plan ports.Plan) error {
@@ -212,6 +240,9 @@ func (b *Backend) validateActionChain(ctx context.Context, plan ports.Plan) erro
 	}
 	if parent.RootPlanDigest != plan.RootPlanDigest || parent.ChainDepth+1 != plan.ChainDepth {
 		return fmt.Errorf("mysql: parent action does not match root/depth")
+	}
+	if parent.SourceNativeTransactionID != plan.Ref.NativeTransactionID {
+		return fmt.Errorf("mysql: parent action does not match source transaction")
 	}
 	latest, err := b.LatestAction(ctx, plan.RootPlanDigest)
 	if err != nil {

@@ -118,17 +118,25 @@ func (w *ApplyWriter) Apply(ctx context.Context, plan *ports.Plan, opts executor
 		// A transport failure around COMMIT does not prove rollback. The
 		// action marker is in the same transaction, so callers can use it
 		// to resolve the outcome before any retry.
-		return ports.ExecutionResult{}, fmt.Errorf("%w: action_id=%s: %v", ports.ErrCommitUnknown, encodeHex(opts.ActionID), err)
+		actionID, decodeErr := ulidString(opts.ActionID)
+		if decodeErr != nil {
+			actionID = encodeHex(opts.ActionID)
+		}
+		return ports.ExecutionResult{ActionID: actionID}, fmt.Errorf("%w: action_id=%s: %v", ports.ErrCommitUnknown, actionID, err)
 	}
 	committed = true
 
+	actionID, err := ulidString(opts.ActionID)
+	if err != nil {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql apply: decode committed action id: %w", err)
+	}
 	return ports.ExecutionResult{
 		// Do not guess this from @@global.gtid_executed: another concurrent
 		// transaction may own the newest GTID. The marker/binlog correlation
 		// path will populate it when action inspection is implemented.
 		CompensatingGTID: "",
 		AffectedRows:     affected,
-		ActionID:         encodeHex(opts.ActionID),
+		ActionID:         actionID,
 	}, nil
 }
 
@@ -271,17 +279,17 @@ func (w *ApplyWriter) writeInsert(ctx context.Context, conn *sql.Conn, op ports.
 		return 0, fmt.Errorf("mysql apply: insert op has no write columns")
 	}
 	cols := quoteNames(op.Write.Columns)
-	placeholders := strings.Repeat("?,", len(op.Write.Columns))
-	placeholders = placeholders[:len(placeholders)-1]
+	placeholders := make([]string, len(op.Write.Values))
 	args := make([]interface{}, len(op.Write.Values))
 	for i, v := range op.Write.Values {
+		placeholders[i] = parameterExpression(v)
 		arg, err := driverValue(v)
 		if err != nil {
 			return 0, fmt.Errorf("mysql apply: insert value: %w", err)
 		}
 		args[i] = arg
 	}
-	q := "INSERT INTO " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " (" + cols + ") VALUES (" + placeholders + ")"
+	q := "INSERT INTO " + quoteIdent(op.Table.Schema) + "." + quoteIdent(op.Table.Name) + " (" + cols + ") VALUES (" + strings.Join(placeholders, ",") + ")"
 	res, err := conn.ExecContext(ctx, q, args...)
 	if err != nil {
 		var me *mysql.MySQLError
@@ -322,7 +330,7 @@ func (w *ApplyWriter) writeUpdate(ctx context.Context, conn *sql.Conn, op ports.
 	sets := make([]string, 0, len(op.Write.Columns))
 	args := make([]interface{}, 0, len(op.Write.Values))
 	for i, c := range op.Write.Columns {
-		sets = append(sets, quoteIdent(c)+" = ?")
+		sets = append(sets, quoteIdent(c)+" = "+parameterExpression(op.Write.Values[i]))
 		arg, err := driverValue(op.Write.Values[i])
 		if err != nil {
 			return 0, fmt.Errorf("mysql apply: update value: %w", err)

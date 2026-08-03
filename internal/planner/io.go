@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -92,92 +93,10 @@ func ShortDigest(d string) string {
 // Two equivalent plans still hash to the same digest because the parser
 // re-discards whitespace.
 func stablePretty(in []byte) ([]byte, error) {
-	var v interface{}
-	if err := json.Unmarshal(in, &v); err != nil {
+	var out bytes.Buffer
+	out.Grow(len(in) + len(in)/4)
+	if err := json.Indent(&out, in, "", "  "); err != nil {
 		return nil, err
 	}
-	return marshalPretty(v, "", 0)
-}
-
-func marshalPretty(v interface{}, indent string, depth int) ([]byte, error) {
-	pad := indent + repeat("  ", depth)
-	inner := indent + repeat("  ", depth+1)
-	switch x := v.(type) {
-	case map[string]interface{}:
-		if len(x) == 0 {
-			return []byte("{}"), nil
-		}
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		// sort.Strings is fine here because we're only using it for
-		// human presentation, not the digest.
-		sortStrings(keys)
-		out := []byte("{\n")
-		for i, k := range keys {
-			kb, err := json.Marshal(k)
-			if err != nil {
-				return nil, err
-			}
-			val, err := marshalPretty(x[k], indent, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, []byte(inner)...)
-			out = append(out, kb...)
-			out = append(out, ':')
-			// Always pad value with a space for readability.
-			out = append(out, ' ')
-			out = append(out, val...)
-			if i < len(keys)-1 {
-				out = append(out, ',')
-			}
-			out = append(out, '\n')
-		}
-		out = append(out, []byte(pad)...)
-		out = append(out, '}')
-		return out, nil
-	case []interface{}:
-		if len(x) == 0 {
-			return []byte("[]"), nil
-		}
-		out := []byte("[\n")
-		for i, e := range x {
-			val, err := marshalPretty(e, indent, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, []byte(inner)...)
-			out = append(out, val...)
-			if i < len(x)-1 {
-				out = append(out, ',')
-			}
-			out = append(out, '\n')
-		}
-		out = append(out, []byte(pad)...)
-		out = append(out, ']')
-		return out, nil
-	default:
-		return json.Marshal(v)
-	}
-}
-
-func repeat(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	out := make([]byte, 0, len(s)*n)
-	for i := 0; i < n; i++ {
-		out = append(out, s...)
-	}
-	return string(out)
-}
-
-func sortStrings(a []string) {
-	for i := 1; i < len(a); i++ {
-		for j := i; j > 0 && a[j-1] > a[j]; j-- {
-			a[j-1], a[j] = a[j], a[j-1]
-		}
-	}
+	return out.Bytes(), nil
 }
