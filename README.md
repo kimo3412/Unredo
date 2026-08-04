@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**v0.1.0-rc4 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。RC4 新增受限归档目录中的本地 MySQL binlog 文件读取；当前 main 继续增加不保存行值的本地事务索引。
+> 当前状态：**v0.1.0-rc5 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。RC5 在本地 binlog 归档读取之上增加了不保存行值的事务索引，支持按 GTID、时间和库表查询。
 
 ## 安装与版本核验
 
