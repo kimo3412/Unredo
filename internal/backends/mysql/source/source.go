@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,9 +33,19 @@ type Source struct {
 	dsn        string
 	instanceID string
 	serverID   uint32
+	localDir   string
 	inspector  *schema.Inspector
 	maxRows    int
 	maxBytes   int64
+}
+
+// NewLocal builds a Source that discovers transactions from archived binlog
+// files in localDir. A live SQL connection is still used for server identity,
+// current schema inspection, safety checks, and compensation execution.
+func NewLocal(dsn, instanceID, localDir string, serverID uint32, maxRows int, maxBytes int64) *Source {
+	s := New(dsn, instanceID, serverID, maxRows, maxBytes)
+	s.localDir = localDir
+	return s
 }
 
 // New builds a Source. serverID must be a non-zero, profile-unique value.
@@ -50,6 +62,21 @@ func New(dsn, instanceID string, serverID uint32, maxRows int, maxBytes int64) *
 
 // Capabilities reports what the connected server actually provides.
 func (s *Source) Capabilities(ctx context.Context) (core.BackendCapabilities, error) {
+	if s.localDir != "" {
+		// Archive files are validated while decoding: Find requires a GTID,
+		// row-width mismatches fail, and missing FULL table metadata marks the
+		// transaction non-executable. The current server's binlog settings do
+		// not describe a historical file and therefore must not gate reading it.
+		return core.BackendCapabilities{
+			FullBeforeImage:       true,
+			FullAfterImage:        true,
+			StableTransactionID:   true,
+			TransactionBoundaries: true,
+			AtomicActionMarker:    true,
+			SchemaAtEventTime:     true,
+			SupportsReapply:       true,
+		}, nil
+	}
 	format, rowImage, gtid, rowMetadata, err := s.settings(ctx)
 	if err != nil {
 		return core.BackendCapabilities{}, err
@@ -113,7 +140,15 @@ func (s *Source) FindActionGTID(ctx context.Context, from json.RawMessage, actio
 	if len(actionID) != 16 {
 		return "", fmt.Errorf("mysql: action id must be 16 bytes, got %d", len(actionID))
 	}
-	it, err := s.Scan(ctx, ports.ScanScope{FromCursor: from})
+	scope := ports.ScanScope{FromCursor: from}
+	pos, err := s.resolveScope(scope)
+	if err != nil {
+		return "", err
+	}
+	// Compensation transactions are always written to the live target. Even
+	// when discovery uses an archived local file, correlation must follow the
+	// live replication stream from the cursor captured immediately pre-apply.
+	it, err := s.scanReplication(ctx, scope, pos)
 	if err != nil {
 		return "", err
 	}
@@ -138,15 +173,26 @@ func (s *Source) FindActionGTID(ctx context.Context, from json.RawMessage, actio
 
 // Scan opens a replication stream and returns an iterator.
 func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.TransactionIterator, error) {
-	if s.serverID == 0 {
-		return nil, fmt.Errorf("mysql: source.server_id is 0; set a non-zero value in the profile")
-	}
 	caps, err := s.Capabilities(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: inspect binlog capabilities: %w", err)
 	}
 	if !caps.FullBeforeImage || !caps.FullAfterImage || !caps.StableTransactionID || !caps.SchemaAtEventTime {
 		return nil, fmt.Errorf("mysql: ROW/FULL/GTID with binlog_row_metadata=FULL required: %w", ports.ErrUnsupportedCapability)
+	}
+	pos, err := s.resolveScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if s.localDir != "" {
+		return s.scanLocal(ctx, scope, pos)
+	}
+	return s.scanReplication(ctx, scope, pos)
+}
+
+func (s *Source) scanReplication(ctx context.Context, scope ports.ScanScope, pos gomysql.Position) (ports.TransactionIterator, error) {
+	if s.serverID == 0 {
+		return nil, fmt.Errorf("mysql: source.server_id is 0; set a non-zero value in the profile")
 	}
 	host, port, user, pass, err := parseDSN(s.dsn)
 	if err != nil {
@@ -161,10 +207,6 @@ func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.Transac
 		Password:       pass,
 		RawModeEnabled: false, // we want the library to decode; we translate types
 	}
-	pos, err := s.resolveScope(scope)
-	if err != nil {
-		return nil, err
-	}
 	syncer := replication.NewBinlogSyncer(cfg)
 	streamer, err := syncer.StartSync(pos)
 	if err != nil {
@@ -173,8 +215,8 @@ func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.Transac
 	}
 	return &binlogIterator{
 		ctx:        ctx,
-		syncer:     syncer,
-		streamer:   streamer,
+		getEvent:   streamer.GetEvent,
+		closeEvent: func() error { syncer.Close(); return nil },
 		instanceID: s.instanceID,
 		inspector:  s.inspector,
 		limit:      scope.Limit,
@@ -182,6 +224,123 @@ func (s *Source) Scan(ctx context.Context, scope ports.ScanScope) (ports.Transac
 		maxBytes:   s.maxBytes,
 		colCache:   map[string][]columnInfo{},
 	}, nil
+}
+
+func (s *Source) scanLocal(ctx context.Context, scope ports.ScanScope, pos gomysql.Position) (ports.TransactionIterator, error) {
+	path, err := resolveLocalBinlogPath(s.localDir, pos.Name)
+	if err != nil {
+		return nil, err
+	}
+	stream := newLocalEventStream(ctx, path, int64(pos.Pos))
+	return &binlogIterator{
+		ctx:        ctx,
+		getEvent:   stream.GetEvent,
+		closeEvent: stream.Close,
+		instanceID: s.instanceID,
+		inspector:  s.inspector,
+		limit:      scope.Limit,
+		maxRows:    s.maxRows,
+		maxBytes:   s.maxBytes,
+		colCache:   map[string][]columnInfo{},
+	}, nil
+}
+
+func resolveLocalBinlogPath(baseDir, name string) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return "", fmt.Errorf("mysql: source.binlog_path is required for local-file mode")
+	}
+	if strings.TrimSpace(name) == "" {
+		return "", fmt.Errorf("mysql: --binlog is required for local-file mode")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("mysql: local binlog name must be relative to source.binlog_path")
+	}
+	base, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("mysql: resolve source.binlog_path: %w", err)
+	}
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		return "", fmt.Errorf("mysql: resolve source.binlog_path links: %w", err)
+	}
+	path, err := filepath.Abs(filepath.Join(base, filepath.Clean(name)))
+	if err != nil {
+		return "", fmt.Errorf("mysql: resolve local binlog: %w", err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("mysql: open local binlog %q: %w", path, err)
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("mysql: local binlog escapes source.binlog_path")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("mysql: open local binlog %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("mysql: local binlog %q is not a regular file", path)
+	}
+	return path, nil
+}
+
+type localEventResult struct {
+	event *replication.BinlogEvent
+	err   error
+}
+
+type localEventStream struct {
+	parser *replication.BinlogParser
+	cancel context.CancelFunc
+	result <-chan localEventResult
+	once   sync.Once
+}
+
+func newLocalEventStream(parent context.Context, path string, offset int64) *localEventStream {
+	ctx, cancel := context.WithCancel(parent)
+	parser := replication.NewBinlogParser()
+	results := make(chan localEventResult)
+	stream := &localEventStream{parser: parser, cancel: cancel, result: results}
+	go func() {
+		defer close(results)
+		err := parser.ParseFile(path, offset, func(event *replication.BinlogEvent) error {
+			select {
+			case results <- localEventResult{event: event}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		if err == nil {
+			err = io.EOF
+		}
+		select {
+		case results <- localEventResult{err: err}:
+		case <-ctx.Done():
+		}
+	}()
+	return stream
+}
+
+func (s *localEventStream) GetEvent(ctx context.Context) (*replication.BinlogEvent, error) {
+	select {
+	case result, ok := <-s.result:
+		if !ok {
+			return nil, io.EOF
+		}
+		return result.event, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *localEventStream) Close() error {
+	s.once.Do(func() {
+		s.parser.Stop()
+		s.cancel()
+	})
+	return nil
 }
 
 // Find locates one transaction by GTID.
@@ -215,6 +374,7 @@ func (s *Source) Find(ctx context.Context, ref core.TransactionRef) (*core.Trans
 			return nil, err
 		}
 		if stripGTIDPrefix(txn.GTID) == want {
+			txn.Ref.Cursor = append(json.RawMessage(nil), ref.Cursor...)
 			return txn, nil
 		}
 	}
@@ -288,8 +448,8 @@ type columnInfo struct {
 // binlogIterator reads events and assembles them into transactions.
 type binlogIterator struct {
 	ctx        context.Context
-	syncer     *replication.BinlogSyncer
-	streamer   *replication.BinlogStreamer
+	getEvent   func(context.Context) (*replication.BinlogEvent, error)
+	closeEvent func() error
 	instanceID string
 	inspector  *schema.Inspector
 
@@ -313,7 +473,9 @@ type binlogIterator struct {
 }
 
 func (b *binlogIterator) Close() error {
-	b.syncer.Close()
+	if b.closeEvent != nil {
+		return b.closeEvent()
+	}
 	return nil
 }
 
@@ -348,7 +510,7 @@ func (b *binlogIterator) Next(ctx context.Context) (*core.Transaction, error) {
 			return out, nil
 		}
 
-		ev, err := b.streamer.GetEvent(ctx)
+		ev, err := b.getEvent(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err

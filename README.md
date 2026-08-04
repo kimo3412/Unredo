@@ -118,7 +118,43 @@ unredo txn show \
   --txn "server-uuid:981"
 ```
 
-首版的 `--binlog` 是 MySQL 服务器上的逻辑 binlog 文件名，通过 replication stream 读取，不是本地文件路径。
+replication profile 中的 `--binlog` 是 MySQL 服务器上的逻辑 binlog 文件名。需要读取已经归档到本机的文件时，复制现有 profile，改用 `local-file` source：
+
+```yaml
+profiles:
+  archive:
+    backend: mysql
+    source:
+      mode: local-file
+      binlog_path: E:/mysql-binlog-archive
+      address: 127.0.0.1:3306
+      user: unredo_reader
+      password_env: UNREDO_READER_PASSWORD
+      server_id: 100001
+    target:
+      address: 127.0.0.1:3306
+      user: unredo_executor
+      password_env: UNREDO_EXECUTOR_PASSWORD
+    policy:
+      require_gtid: true
+      require_full_row_image: true
+      require_primary_key: true
+      max_transaction_rows: 1000
+      max_transaction_bytes: 67108864
+      max_plan_bytes: 134217728
+      max_action_depth: 20
+      lock_wait_timeout: 5s
+```
+
+随后用归档目录内的相对文件名读取，不能传绝对路径或 `..` 逃出归档目录：
+
+```bash
+unredo txn list --profile archive --binlog binlog.000051 --from-pos 4 --max-time 5s
+unredo plan create --profile archive --binlog binlog.000051 --txn "server-uuid:981" --output undo-981.json
+```
+
+本地文件模式仍连接 source MySQL，以核对实例 UUID、读取当前 schema 并生成安全计划；它不要求 reader 拥有 replication 权限。归档文件必须来自该实例并包含 GTID、ROW/FULL row image 和 FULL row metadata，缺失或与当前 schema 不一致时会 fail closed。`server_id` 仅用于 apply 后从实时 replication stream 精确关联补偿 GTID；若未配置或 reader 无 replication 权限，补偿事务仍可成功提交，但会返回 GTID correlation warning。
+
 `txn list --max-time` 是流式读取窗口：时间到后会保留已经输出的事务并正常退出；`--limit` 达到时会提前退出。
 默认表格会完整输出 GTID，不会为了列宽截断事务序号，因而可以直接复制给 `txn show` 或 `plan create`。
 
@@ -284,7 +320,7 @@ unredo plan apply undo-981-depth-2.json
 - MySQL 8、InnoDB、ROW/FULL binlog、GTID。
 - 支持 INSERT、UPDATE、DELETE。
 - DDL、XA、跨实例事务和数据库外副作用不支持自动恢复。
-- 首版只支持远程 replication stream；本地 binlog 文件是后续模式。
+- 支持远程 replication stream，以及本机归档目录中的 MySQL binlog 文件；对象存储归档尚未支持。
 - 首版面向 DBA 和数据库开发者，不识别业务用户的“上一步”。
 
 项目采用数据库无关 core + backend adapter 结构。未来增加 PostgreSQL 等后端时，CLI 和核心 revert/reapply 工作流保持不变。

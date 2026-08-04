@@ -146,6 +146,15 @@ func (c *Config) Profile(name string) (*Profile, error) {
 		if err := validatePolicy(pp.Policy); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", name, err)
 		}
+		switch pp.Source.Mode {
+		case SourceReplication:
+		case SourceLocalFile:
+			if pp.Source.BinlogPath == "" {
+				return nil, fmt.Errorf("profile %q: source.binlog_path is required for local-file mode", name)
+			}
+		default:
+			return nil, fmt.Errorf("profile %q: unsupported source.mode %q", name, pp.Source.Mode)
+		}
 		return &pp, nil
 	}
 	names := make([]string, 0, len(c.Profiles))

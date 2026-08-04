@@ -35,6 +35,8 @@ type Backend struct {
 	sourceDSN        string
 	targetDSN        string
 	serverID         uint32
+	sourceMode       config.SourceMode
+	localBinlogDir   string
 	policy           config.Policy
 	inspector        ports.SchemaInspector
 	source           *mysqlsource.Source
@@ -49,8 +51,11 @@ func NewBackend(p *config.Profile) (ports.Backend, error) {
 	if p.Backend != "mysql" {
 		return nil, fmt.Errorf("mysql: profile backend is %q, not mysql", p.Backend)
 	}
-	if p.Source.Mode != config.SourceReplication {
-		return nil, fmt.Errorf("mysql: source.mode %q not yet supported in M0", p.Source.Mode)
+	if p.Source.Mode != config.SourceReplication && p.Source.Mode != config.SourceLocalFile {
+		return nil, fmt.Errorf("mysql: unsupported source.mode %q", p.Source.Mode)
+	}
+	if p.Source.Mode == config.SourceLocalFile && p.Source.BinlogPath == "" {
+		return nil, fmt.Errorf("mysql: source.binlog_path is required for local-file mode")
 	}
 	srcDSN, err := buildDSN(p.Source.Address, p.Source.User, p.Source.PasswordEnv, p.Source.ServerID)
 	if err != nil {
@@ -69,16 +74,23 @@ func NewBackend(p *config.Profile) (ports.Backend, error) {
 		return nil, fmt.Errorf("mysql: detect target server uuid: %w", err)
 	}
 	insp := schema.NewInspector(srcDSN)
+	src := mysqlsource.New(srcDSN, instanceID, p.Source.ServerID,
+		p.Policy.MaxTransactionRows, p.Policy.MaxTransactionBytes)
+	if p.Source.Mode == config.SourceLocalFile {
+		src = mysqlsource.NewLocal(srcDSN, instanceID, p.Source.BinlogPath, p.Source.ServerID,
+			p.Policy.MaxTransactionRows, p.Policy.MaxTransactionBytes)
+	}
 	return &Backend{
 		instanceID:       instanceID,
 		targetInstanceID: targetInstanceID,
 		sourceDSN:        srcDSN,
 		targetDSN:        tgtDSN,
 		serverID:         p.Source.ServerID,
+		sourceMode:       p.Source.Mode,
+		localBinlogDir:   p.Source.BinlogPath,
 		policy:           p.Policy,
 		inspector:        insp,
-		source: mysqlsource.New(srcDSN, instanceID, p.Source.ServerID,
-			p.Policy.MaxTransactionRows, p.Policy.MaxTransactionBytes),
+		source:           src,
 	}, nil
 }
 
@@ -318,7 +330,7 @@ func (b *Backend) buildApplyOptions(plan ports.Plan, req ports.ApplyRequest) (ex
 
 // RunDoctor exposes the doctor checks for the CLI.
 func (b *Backend) RunDoctor(_ context.Context, d *doctor.Deps) (*doctor.Report, error) {
-	return doctor.Run(d, b.sourceDSN, b.targetDSN, b.instanceID, b.serverID, b.policy)
+	return doctor.Run(d, b.sourceDSN, b.targetDSN, b.instanceID, b.serverID, b.sourceMode, b.localBinlogDir, b.policy)
 }
 
 func buildDSN(addr, user, passwordEnv string, serverID uint32) (string, error) {

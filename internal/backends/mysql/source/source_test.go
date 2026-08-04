@@ -1,6 +1,8 @@
 package source
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -8,6 +10,55 @@ import (
 
 	"github.com/girimi/unredo/internal/core"
 )
+
+func TestResolveLocalBinlogPathConfinesFilesToArchiveDirectory(t *testing.T) {
+	dir := t.TempDir()
+	want := filepath.Join(dir, "binlog.000001")
+	if err := os.WriteFile(want, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveLocalBinlogPath(dir, "binlog.000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("resolved path = %q, want %q", got, want)
+	}
+	for _, name := range []string{"../outside", filepath.Join(dir, "binlog.000001")} {
+		if _, err := resolveLocalBinlogPath(dir, name); err == nil {
+			t.Fatalf("expected unsafe path %q to be rejected", name)
+		}
+	}
+}
+
+func TestResolveLocalBinlogPathRequiresRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := resolveLocalBinlogPath(dir, "missing"); err == nil {
+		t.Fatal("expected missing local binlog to be rejected")
+	}
+	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveLocalBinlogPath(dir, "nested"); err == nil {
+		t.Fatal("expected directory to be rejected as a binlog")
+	}
+}
+
+func TestResolveLocalBinlogPathRejectsSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "binlog.000001")
+	if err := os.WriteFile(outside, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "linked-binlog")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	if _, err := resolveLocalBinlogPath(dir, "linked-binlog"); err == nil {
+		t.Fatal("expected symlink escaping the archive directory to be rejected")
+	}
+}
 
 func TestDDLQueryEventCompletesWithoutXID(t *testing.T) {
 	iterator := &binlogIterator{instanceID: "server-uuid"}

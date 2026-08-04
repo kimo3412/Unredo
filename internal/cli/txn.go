@@ -35,7 +35,7 @@ func newTxnListCmd() *cobra.Command {
 		Short: "Stream committed transactions from the binlog within a cursor range",
 		RunE:  runTxnList,
 	}
-	c.Flags().String("binlog", "", "starting binlog file (server-side logical name, e.g. mysql-bin.000123)")
+	c.Flags().String("binlog", "", "starting binlog name (server logical name, or archive filename in local-file mode)")
 	c.Flags().Uint32("from-pos", 4, "position to start reading from")
 	c.Flags().String("database", "", "filter to one database")
 	c.Flags().String("table", "", "filter to one table")
@@ -50,7 +50,7 @@ func newTxnShowCmd() *cobra.Command {
 		Short: "Show row changes for one transaction, by GTID",
 		RunE:  runTxnShow,
 	}
-	c.Flags().String("binlog", "", "starting binlog file")
+	c.Flags().String("binlog", "", "starting binlog name (server logical name, or archive filename in local-file mode)")
 	c.Flags().Uint32("from-pos", 4, "starting position")
 	c.Flags().String("txn", "", "transaction id (uuid:gnum)")
 	c.Flags().Bool("show-values", false, "print full values (sensitive)")

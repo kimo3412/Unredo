@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -46,7 +47,7 @@ type Deps struct {
 // Run executes every check. The result is suitable for both human output
 // and machine parsing. It does not abort early on failures; instead it
 // collects everything so the operator sees the full picture.
-func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, serverID uint32, policy config.Policy) (*Report, error) {
+func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, serverID uint32, sourceMode config.SourceMode, localBinlogDir string, policy config.Policy) (*Report, error) {
 	if deps == nil {
 		deps = &Deps{Context: context.Background(), Timeout: 30 * time.Second}
 	}
@@ -59,7 +60,7 @@ func Run(deps *Deps, sourceDSN, targetDSN, serverUUID string, serverID uint32, p
 	}
 
 	if err := openAndCheck(ctx, sourceDSN, "source", r, func(ctx context.Context, db *sql.DB) error {
-		return checkSource(ctx, db, serverID, policy, r)
+		return checkSource(ctx, db, serverID, sourceMode, localBinlogDir, policy, r)
 	}); err != nil {
 		r.Checks = append(r.Checks, Check{
 			Name:     "source.connect",
@@ -108,8 +109,12 @@ func openAndCheck(ctx context.Context, dsn, label string, r *Report, fn func(con
 	return fn(ctx, db)
 }
 
-func checkSource(ctx context.Context, db *sql.DB, serverID uint32, policy config.Policy, r *Report) error {
+func checkSource(ctx context.Context, db *sql.DB, serverID uint32, sourceMode config.SourceMode, localBinlogDir string, policy config.Policy, r *Report) error {
 	checkVersion(ctx, db, r)
+	if sourceMode == config.SourceLocalFile {
+		checkLocalBinlogDirectory(localBinlogDir, r)
+		return nil
+	}
 	checkVariable(ctx, db, r, "log_bin", "ON", true)
 	checkVariable(ctx, db, r, "binlog_format", "ROW", true)
 	checkVariable(ctx, db, r, "binlog_row_image", "FULL", true)
@@ -119,6 +124,19 @@ func checkSource(ctx context.Context, db *sql.DB, serverID uint32, policy config
 	checkReplPrivs(ctx, db, r)
 	checkServerID(ctx, db, serverID, r)
 	return nil
+}
+
+func checkLocalBinlogDirectory(path string, r *Report) {
+	info, err := os.Stat(path)
+	if err != nil {
+		r.Checks = append(r.Checks, Check{Name: "mysql.local_binlog_path", Severity: SeverityError, Message: err.Error()})
+		return
+	}
+	if !info.IsDir() {
+		r.Checks = append(r.Checks, Check{Name: "mysql.local_binlog_path", Severity: SeverityError, Message: "must be a directory"})
+		return
+	}
+	r.Checks = append(r.Checks, Check{Name: "mysql.local_binlog_path", Severity: SeverityOK, Message: path})
 }
 
 func checkServerID(ctx context.Context, db *sql.DB, serverID uint32, r *Report) {

@@ -44,7 +44,7 @@ func newPlanCreateCmd() *cobra.Command {
 		Short: "Generate a self-contained compensation plan from a binlog transaction",
 		RunE:  runPlanCreate,
 	}
-	c.Flags().String("binlog", "", "starting binlog file")
+	c.Flags().String("binlog", "", "starting binlog name (server logical name, or archive filename in local-file mode)")
 	c.Flags().Uint32("from-pos", 4, "starting position in --binlog")
 	c.Flags().String("txn", "", "transaction id (uuid:gnum)")
 	c.Flags().String("mode", "revert", "revert|reapply")

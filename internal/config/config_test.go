@@ -43,3 +43,28 @@ func TestProfileRejectsNegativeSafetyLimit(t *testing.T) {
 		t.Fatalf("expected negative limit rejection, got %v", err)
 	}
 }
+
+func TestProfileAcceptsLocalFileSourceWithArchiveDirectory(t *testing.T) {
+	cfg := &Config{Profiles: map[string]Profile{
+		"archive": {
+			Source: Source{Mode: SourceLocalFile, BinlogPath: "D:/mysql-archive"},
+			Policy: DefaultPolicy(),
+		},
+	}}
+	profile, err := cfg.Profile("archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Source.Mode != SourceLocalFile || profile.Source.BinlogPath != "D:/mysql-archive" {
+		t.Fatalf("unexpected local-file source: %+v", profile.Source)
+	}
+}
+
+func TestProfileRejectsLocalFileSourceWithoutArchiveDirectory(t *testing.T) {
+	cfg := &Config{Profiles: map[string]Profile{
+		"archive": {Source: Source{Mode: SourceLocalFile}, Policy: DefaultPolicy()},
+	}}
+	if _, err := cfg.Profile("archive"); err == nil || !strings.Contains(err.Error(), "source.binlog_path") {
+		t.Fatalf("expected missing archive directory error, got %v", err)
+	}
+}
