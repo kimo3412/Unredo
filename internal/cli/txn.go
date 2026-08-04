@@ -148,7 +148,7 @@ func runTxnListTable(ctx context.Context, cmd *cobra.Command, iter ports.Transac
 			gtid = txn.Ref.NativeTransactionID
 		}
 		fmt.Fprintf(out, "%-40s %-22s %5d %-40s %-10s\n",
-			truncate(gtid, 40),
+			gtid,
 			txn.CommitTime.Format(time.RFC3339),
 			transactionRowCount(txn),
 			truncate(tables, 40),

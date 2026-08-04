@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**v0.1.0-rc1 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。当前 main 正在汇入首轮真实试用反馈。
+> 当前状态：**v0.1.0-rc2 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。当前 main 正在汇入首轮真实试用反馈。
 
 ## 安装与版本核验
 
@@ -120,6 +120,7 @@ unredo txn show \
 
 首版的 `--binlog` 是 MySQL 服务器上的逻辑 binlog 文件名，通过 replication stream 读取，不是本地文件路径。
 `txn list --max-time` 是流式读取窗口：时间到后会保留已经输出的事务并正常退出；`--limit` 达到时会提前退出。
+默认表格会完整输出 GTID，不会为了列宽截断事务序号，因而可以直接复制给 `txn show` 或 `plan create`。
 
 无主键表和非 InnoDB 表仍可 `list/show`，但不会生成可执行计划。
 
