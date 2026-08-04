@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**v0.1.0-rc4 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。RC4 新增受限归档目录中的本地 MySQL binlog 文件读取，并保留 RC3 对流式读取超时、action marker 版本审计和长 GTID 展示的修复。
+> 当前状态：**v0.1.0-rc4 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。RC4 新增受限归档目录中的本地 MySQL binlog 文件读取；当前 main 继续增加不保存行值的本地事务索引。
 
 ## 安装与版本核验
 
@@ -154,6 +154,33 @@ unredo plan create --profile archive --binlog binlog.000051 --txn "server-uuid:9
 ```
 
 本地文件模式仍连接 source MySQL，以核对实例 UUID、读取当前 schema 并生成安全计划；它不要求 reader 拥有 replication 权限。归档文件必须来自该实例并包含 GTID、ROW/FULL row image 和 FULL row metadata，缺失或与当前 schema 不一致时会 fail closed。`server_id` 仅用于 apply 后从实时 replication stream 精确关联补偿 GTID；若未配置或 reader 无 replication 权限，补偿事务仍可成功提交，但会返回 GTID correlation warning。
+
+### 归档事务索引
+
+归档目录有多个 binlog 时，可以一次扫描并生成 JSONL 摘要索引：
+
+```bash
+unredo index build \
+  --profile archive \
+  --output archive-transactions.jsonl
+```
+
+索引记录 GTID、commit time、行数、涉及表、可执行状态和源文件 cursor，不保存 before/after row image。输出采用临时文件完成后再发布，并且绝不覆盖已有路径；需要重建时应写入新文件名，验证后再由 DBA 切换。
+
+查询索引不需要连接 MySQL，也不需要提供 profile：
+
+```bash
+unredo index query archive-transactions.jsonl \
+  --gtid "server-uuid:981"
+
+unredo index query archive-transactions.jsonl \
+  --table shop.orders \
+  --since 2026-08-01T00:00:00Z \
+  --until 2026-08-02T00:00:00Z \
+  --limit 100
+```
+
+查询结果中的 `FILE` 可直接作为相同 archive profile 的 `txn show` 或 `plan create --binlog` 参数。索引是构建时快照；归档目录增加文件后需要生成新索引。
 
 `txn list --max-time` 是流式读取窗口：时间到后会保留已经输出的事务并正常退出；`--limit` 达到时会提前退出。
 默认表格会完整输出 GTID，不会为了列宽截断事务序号，因而可以直接复制给 `txn show` 或 `plan create`。

@@ -1,6 +1,8 @@
 package source
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/girimi/unredo/internal/core"
+	"github.com/girimi/unredo/internal/ports"
 )
 
 func TestResolveLocalBinlogPathConfinesFilesToArchiveDirectory(t *testing.T) {
@@ -57,6 +60,32 @@ func TestResolveLocalBinlogPathRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := resolveLocalBinlogPath(dir, "linked-binlog"); err == nil {
 		t.Fatal("expected symlink escaping the archive directory to be rejected")
+	}
+}
+
+func TestListLogFilesIncludesOnlyRegularBinlogs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "binlog.000001"), replication.BinLogFileHeader, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a binlog"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := NewLocal("", "instance", dir, 1, 100, 1<<20)
+	files, err := source.ListLogFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Name != "binlog.000001" || files[0].Size != int64(len(replication.BinLogFileHeader)) {
+		t.Fatalf("unexpected files: %+v", files)
+	}
+}
+
+func TestListLogFilesRejectsReplicationMode(t *testing.T) {
+	source := New("", "instance", 1, 100, 1<<20)
+	_, err := source.ListLogFiles(context.Background())
+	if !errors.Is(err, ports.ErrUnsupportedCapability) {
+		t.Fatalf("expected unsupported capability, got %v", err)
 	}
 }
 

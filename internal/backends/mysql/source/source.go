@@ -245,6 +245,50 @@ func (s *Source) scanLocal(ctx context.Context, scope ports.ScanScope, pos gomys
 	}, nil
 }
 
+// ListLogFiles returns regular MySQL binlog files directly inside the
+// configured archive directory. Symlinks and unrelated files are ignored.
+func (s *Source) ListLogFiles(ctx context.Context) ([]ports.LogFile, error) {
+	if s.localDir == "" {
+		return nil, fmt.Errorf("mysql: transaction indexing requires source.mode local-file: %w", ports.ErrUnsupportedCapability)
+	}
+	entries, err := os.ReadDir(s.localDir)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: read local binlog directory: %w", err)
+	}
+	files := make([]ports.LogFile, 0, len(entries))
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			continue
+		}
+		path, err := resolveLocalBinlogPath(s.localDir, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("mysql: inspect local binlog %q: %w", entry.Name(), err)
+		}
+		header := make([]byte, len(replication.BinLogFileHeader))
+		_, readErr := io.ReadFull(file, header)
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(header, replication.BinLogFileHeader) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("mysql: stat local binlog %q: %w", entry.Name(), err)
+		}
+		files = append(files, ports.LogFile{Name: entry.Name(), Size: info.Size(), ModifiedAt: info.ModTime().UTC()})
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("mysql: no valid binlog files found in %q", s.localDir)
+	}
+	return files, nil
+}
+
 func resolveLocalBinlogPath(baseDir, name string) (string, error) {
 	if strings.TrimSpace(baseDir) == "" {
 		return "", fmt.Errorf("mysql: source.binlog_path is required for local-file mode")

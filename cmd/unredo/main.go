@@ -6,9 +6,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 
 	// Side-effect: registers the mysql backend with the registry.
 	_ "github.com/girimi/unredo/internal/backends/mysql"
@@ -26,7 +28,9 @@ func main() {
 		log.SetOutput(devNull{})
 	}
 	root := cli.NewRoot()
-	if err := root.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}

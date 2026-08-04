@@ -49,6 +49,20 @@ type ChangeSource interface {
 	Find(ctx context.Context, ref core.TransactionRef) (*core.Transaction, error)
 }
 
+// LogFile is one finite archived change-log file available to a backend.
+// Name is opaque to core callers and is passed back in a backend cursor.
+type LogFile struct {
+	Name       string    `json:"name"`
+	Size       int64     `json:"size"`
+	ModifiedAt time.Time `json:"modified_at"`
+}
+
+// LogCatalog enumerates finite archive files for offline indexing. Live
+// replication backends may return ErrUnsupportedCapability.
+type LogCatalog interface {
+	ListLogFiles(ctx context.Context) ([]LogFile, error)
+}
+
 // ColumnDef describes one column as reported by the backend.
 type ColumnDef = core.ColumnDef
 

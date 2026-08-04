@@ -19,6 +19,7 @@ import (
 
 	mysqlsource "github.com/girimi/unredo/internal/backends/mysql/source"
 	"github.com/girimi/unredo/internal/core"
+	"github.com/girimi/unredo/internal/txnindex"
 )
 
 func TestLocalBinlogArchiveFindsCommittedTransaction(t *testing.T) {
@@ -88,6 +89,28 @@ func TestLocalBinlogArchiveFindsCommittedTransaction(t *testing.T) {
 	var savedCursor map[string]any
 	if err := json.Unmarshal(txn.Ref.Cursor, &savedCursor); err != nil || savedCursor["file"] != binlogName {
 		t.Fatalf("transaction did not retain archive cursor: %s (%v)", txn.Ref.Cursor, err)
+	}
+
+	indexPath := filepath.Join(t.TempDir(), "transactions.jsonl")
+	build, err := txnindex.Build(ctx, source, source, txnindex.BuildOptions{
+		OutputPath: indexPath, Backend: "mysql", InstanceID: instanceID,
+	})
+	if err != nil {
+		t.Fatalf("build archive index: %v", err)
+	}
+	if build.FilesScanned != 1 || build.Transactions == 0 {
+		t.Fatalf("unexpected index build result: %+v", build)
+	}
+	var indexed []txnindex.Entry
+	_, count, err := txnindex.Query(ctx, indexPath, txnindex.Filter{GTID: gtid}, func(entry txnindex.Entry) error {
+		indexed = append(indexed, entry)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("query archive index: %v", err)
+	}
+	if count != 1 || len(indexed) != 1 || indexed[0].SourceFile != binlogName || indexed[0].Ref.NativeTransactionID != gtid {
+		t.Fatalf("unexpected indexed transaction: count=%d entries=%+v", count, indexed)
 	}
 }
 

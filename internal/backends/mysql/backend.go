@@ -132,6 +132,11 @@ func (b *Backend) Find(ctx context.Context, ref core.TransactionRef) (*core.Tran
 	return b.source.Find(ctx, ref)
 }
 
+// ListLogFiles enumerates local archive files for index construction.
+func (b *Backend) ListLogFiles(ctx context.Context) ([]ports.LogFile, error) {
+	return b.source.ListLogFiles(ctx)
+}
+
 // Check verifies that the current state of the target database still
 // matches the plan's expect images. The executor itself lives in
 // internal/executor; this method adapts the result into ports.Conflict.
