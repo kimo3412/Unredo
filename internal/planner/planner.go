@@ -553,6 +553,7 @@ func computeDigest(p *Plan) string {
 func (p *Plan) ToPorts() *ports.Plan {
 	out := &ports.Plan{
 		PlanID:             p.PlanID,
+		ToolVersion:        p.ToolVersion,
 		Mode:               string(p.Mode),
 		ExecutionClass:     string(p.ExecutionClass),
 		Ref:                p.Source,

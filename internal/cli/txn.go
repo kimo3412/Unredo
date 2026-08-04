@@ -97,17 +97,20 @@ func runTxnList(cmd *cobra.Command, _ []string) error {
 
 	format, _ := cmd.Flags().GetString("format")
 	if format == "json" {
-		return runTxnListJSON(cmd, iter)
+		return runTxnListJSON(ctx, cmd, iter)
 	}
-	return runTxnListTable(cmd, iter, p)
+	return runTxnListTable(ctx, cmd, iter, p)
 }
 
-func runTxnListJSON(cmd *cobra.Command, iter ports.TransactionIterator) error {
+func runTxnListJSON(ctx context.Context, cmd *cobra.Command, iter ports.TransactionIterator) error {
 	enc := json.NewEncoder(cmd.OutOrStdout())
 	for {
-		txn, err := iter.Next(cmd.Context())
+		txn, err := iter.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil
 			}
 			return err
@@ -118,13 +121,16 @@ func runTxnListJSON(cmd *cobra.Command, iter ports.TransactionIterator) error {
 	}
 }
 
-func runTxnListTable(cmd *cobra.Command, iter ports.TransactionIterator, _ *config.Profile) error {
+func runTxnListTable(ctx context.Context, cmd *cobra.Command, iter ports.TransactionIterator, _ *config.Profile) error {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "%-40s %-22s %5s %-40s %-10s\n", "GTID", "COMMIT_TIME", "ROWS", "TABLES", "REVERSIBLE")
 	for {
-		txn, err := iter.Next(cmd.Context())
+		txn, err := iter.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil
 			}
 			return err

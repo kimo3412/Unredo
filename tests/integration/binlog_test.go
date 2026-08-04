@@ -558,6 +558,9 @@ func TestEndToEndRevertThenReapply(t *testing.T) {
 	if revertAction.RootPlanDigest != rootPlan.Digest || revertAction.PlanDigest != rootPlan.Digest {
 		t.Fatalf("revert marker digest mismatch: %+v", revertAction)
 	}
+	if revertAction.ToolVersion != rootPlan.ToolVersion {
+		t.Fatalf("action marker tool version %q does not match plan %q", revertAction.ToolVersion, rootPlan.ToolVersion)
+	}
 	verifyCommitted := runCLI(t, true,
 		"action", "verify", "--action-id", revertActionID,
 		"--plan", rootPlanPath, "--wait", "0s",
@@ -984,6 +987,7 @@ func actionShow(t *testing.T, actionID string) struct {
 	ChainDepth     uint32    `json:"chain_depth"`
 	CreatedAt      time.Time `json:"created_at"`
 	ExecutionClass string    `json:"execution_class"`
+	ToolVersion    string    `json:"tool_version"`
 } {
 	t.Helper()
 	out := runCLI(t, true, "--format", "json", "action", "show", "--action-id", actionID)
@@ -997,6 +1001,7 @@ func actionShow(t *testing.T, actionID string) struct {
 		ChainDepth     uint32    `json:"chain_depth"`
 		CreatedAt      time.Time `json:"created_at"`
 		ExecutionClass string    `json:"execution_class"`
+		ToolVersion    string    `json:"tool_version"`
 	}
 	if err := json.Unmarshal([]byte(out), &action); err != nil {
 		t.Fatalf("decode action show: %v\n%s", err, out)

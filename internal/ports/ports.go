@@ -102,6 +102,7 @@ type CheckResult struct {
 // representation may add backend extensions; this is the core subset.
 type Plan struct {
 	PlanID             string              `json:"plan_id,omitempty"`
+	ToolVersion        string              `json:"tool_version,omitempty"`
 	Mode               string              `json:"mode,omitempty"`            // "revert" or "reapply"
 	ExecutionClass     string              `json:"execution_class,omitempty"` // "safe" or "unsafe_resolved"
 	Ref                core.TransactionRef `json:"source"`

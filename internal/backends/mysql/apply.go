@@ -59,6 +59,12 @@ func (w *ApplyWriter) Apply(ctx context.Context, plan *ports.Plan, opts executor
 	if plan == nil {
 		return ports.ExecutionResult{}, fmt.Errorf("mysql apply: nil plan")
 	}
+	if plan.ToolVersion == "" {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql apply: plan tool_version is empty")
+	}
+	if len(plan.ToolVersion) > 32 {
+		return ports.ExecutionResult{}, fmt.Errorf("mysql apply: plan tool_version exceeds 32 bytes")
+	}
 	if err := opts.Validate(); err != nil {
 		return ports.ExecutionResult{}, err
 	}
@@ -212,7 +218,7 @@ func (w *ApplyWriter) insertMarker(ctx context.Context, conn *sql.Conn, plan *po
 		digestBin,
 		opts.ExecutionClass,
 		nullString(opts.Reason),
-		"0.1.0-m3",
+		plan.ToolVersion,
 		opts.OperatorName,
 	)
 	if err != nil {

@@ -4,7 +4,7 @@ Unredo 计划成为一个用 Go 编写的数据库事务补偿 CLI。首个后�
 
 它的语义类似 `git revert`，不会倒放或修改 InnoDB redo log。
 
-> 当前状态：**M0-M2 已完成，M3 完整交替 action 链、冲突 resolve、初始化流程、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归已跑通**。实验版发布仍待办。
+> 当前状态：**v0.1.0-rc1 已发布**；M0-M3、完整交替 action 链、冲突 resolve、COMMIT 未知恢复、补偿 GTID 精确关联、大事务基准与边缘类型回归均已跑通。当前 main 正在汇入首轮真实试用反馈。
 
 ## 安装与版本核验
 
@@ -109,7 +109,8 @@ unredo doctor --profile local
 unredo txn list \
   --profile local \
   --binlog mysql-bin.000123 \
-  --from-pos 4
+  --from-pos 4 \
+  --max-time 5s
 
 unredo txn show \
   --profile local \
@@ -118,6 +119,7 @@ unredo txn show \
 ```
 
 首版的 `--binlog` 是 MySQL 服务器上的逻辑 binlog 文件名，通过 replication stream 读取，不是本地文件路径。
+`txn list --max-time` 是流式读取窗口：时间到后会保留已经输出的事务并正常退出；`--limit` 达到时会提前退出。
 
 无主键表和非 InnoDB 表仍可 `list/show`，但不会生成可执行计划。
 
@@ -137,6 +139,8 @@ unredo plan apply --profile local undo-981.json
 计划包含执行所需的行 image、唯一键和 schema 指纹。计划生成后，即使源 binlog 已被 purge，仍可 check/apply；当前数据或 schema 已变化时会报告冲突。
 
 成功执行会输出 action ID、affected rows 和补偿事务 GTID。GTID 不取 `@@global.gtid_executed` 的尾部：Unredo 在 apply 前捕获 binlog 起点，提交后从该位置扫描，并且只接受包含本次 16 字节 action marker 的事务，因此不会把并发事务误认为补偿事务。MySQL 8.0 的 `SHOW MASTER STATUS` 和 MySQL 8.2+ 的 `SHOW BINARY LOG STATUS` 均受支持。
+
+action marker 的 `tool_version` 来自实际执行的计划文件，而不是运行时常量，因此根 revert、resolved plan 和后续 reapply/revert 链都能保留生成该计划的准确版本。
 
 GTID 关联是提交后的审计增强，不参与事务成败判断。如果补偿已经提交，但 binlog 被立即 purge、replication 连接失败或关联超时，命令仍按成功返回 action ID，同时输出 `GTID correlation failed` warning，GTID 留空；不得因为 GTID 为空而重试补偿。
 

@@ -76,6 +76,13 @@ func TestBuildReapplyForwardOrder(t *testing.T) {
 	}
 }
 
+func TestToPortsPreservesToolVersion(t *testing.T) {
+	plan := &Plan{PlanID: "01K1TEST000000000000000000", ToolVersion: "0.1.0-rc2"}
+	if got := plan.ToPorts().ToolVersion; got != plan.ToolVersion {
+		t.Fatalf("ports tool version = %q, want %q", got, plan.ToolVersion)
+	}
+}
+
 func TestBuildReapplyInvertsRootRevertAndPreservesChain(t *testing.T) {
 	root := &Plan{
 		FormatVersion:      FormatVersion,
