@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,6 +74,7 @@ func Build(ctx context.Context, source ports.ChangeSource, catalog ports.LogCata
 	if err != nil {
 		return result, err
 	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 	dir := filepath.Dir(options.OutputPath)
 	if dir == "" {
 		dir = "."

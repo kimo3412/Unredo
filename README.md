@@ -182,6 +182,22 @@ unredo index query archive-transactions.jsonl \
 
 查询结果中的 `FILE` 可直接作为相同 archive profile 的 `txn show` 或 `plan create --binlog` 参数。索引是构建时快照；归档目录增加文件后需要生成新索引。
 
+先用 `index check` 比较索引快照与当前归档目录：
+
+```bash
+unredo index check archive-transactions.jsonl --profile archive
+```
+
+输出为 `CURRENT` 或 `STALE`，并根据文件名、大小和修改时间列出 added、changed、removed 文件。对于正常的归档追加，可以复用旧索引中的不可变文件摘要，只重新扫描增长中的末尾文件和新文件，同时写入一个新索引：
+
+```bash
+unredo index update archive-transactions.jsonl \
+  --profile archive \
+  --output archive-transactions-v2.jsonl
+```
+
+增量更新只接受两种安全变化：原快照最后一个 binlog 变大，以及按文件名顺序追加更晚的 binlog。文件被删除、旧文件被改写或较早文件乱序出现时会拒绝增量更新，并要求重新执行 `index build`。旧索引永远不会被修改；如果快照仍是 `CURRENT`，命令正常退出且不会创建新文件。
+
 `txn list --max-time` 是流式读取窗口：时间到后会保留已经输出的事务并正常退出；`--limit` 达到时会提前退出。
 默认表格会完整输出 GTID，不会为了列宽截断事务序号，因而可以直接复制给 `txn show` 或 `plan create`。
 

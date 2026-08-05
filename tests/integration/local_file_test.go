@@ -68,7 +68,7 @@ func TestLocalBinlogArchiveFindsCommittedTransaction(t *testing.T) {
 	cfg.Loc = time.UTC
 	source := mysqlsource.NewLocal(cfg.FormatDSN(), instanceID, archiveDir, 100001, 1000, 64<<20)
 	cursor, _ := json.Marshal(map[string]any{"file": binlogName, "start_pos": 4})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	txn, err := source.Find(ctx, core.TransactionRef{
 		Backend:             "mysql",
@@ -111,6 +111,39 @@ func TestLocalBinlogArchiveFindsCommittedTransaction(t *testing.T) {
 	}
 	if count != 1 || len(indexed) != 1 || indexed[0].SourceFile != binlogName || indexed[0].Ref.NativeTransactionID != gtid {
 		t.Fatalf("unexpected indexed transaction: count=%d entries=%+v", count, indexed)
+	}
+
+	marker2 := fmt.Sprintf("incr-%d", time.Now().UnixNano()%100000000)
+	result2, err := execConn.Exec(
+		"INSERT INTO unredo_shop.orders (user_id, status, amount) VALUES (?, ?, ?)",
+		markerUser+1, marker2, "18.25",
+	)
+	if err != nil {
+		t.Fatalf("insert incremental fixture: %v", err)
+	}
+	rowID2, _ := result2.LastInsertId()
+	t.Cleanup(func() { _, _ = execConn.Exec("DELETE FROM unredo_shop.orders WHERE id = ?", rowID2) })
+	gtid2, err := latestGTID(rootConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveBinlog(t, rootConn, binlogName, filepath.Join(archiveDir, binlogName))
+	updatedPath := filepath.Join(t.TempDir(), "transactions-updated.jsonl")
+	updated, err := txnindex.Update(ctx, source, source, txnindex.UpdateOptions{
+		ExistingPath: indexPath, OutputPath: updatedPath, Backend: "mysql", InstanceID: instanceID,
+	})
+	if err != nil {
+		t.Fatalf("increment archive index: %v", err)
+	}
+	if updated.Current || updated.FilesRescanned != 1 || updated.ScannedTransactions <= build.Transactions {
+		t.Fatalf("unexpected incremental result: old=%+v updated=%+v", build, updated)
+	}
+	_, count, err = txnindex.Query(ctx, updatedPath, txnindex.Filter{GTID: gtid2}, func(entry txnindex.Entry) error {
+		indexed = append(indexed, entry)
+		return nil
+	})
+	if err != nil || count != 1 || indexed[len(indexed)-1].Ref.NativeTransactionID != gtid2 {
+		t.Fatalf("incremented index missing %s: count=%d entries=%+v err=%v", gtid2, count, indexed, err)
 	}
 }
 

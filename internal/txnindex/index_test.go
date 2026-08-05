@@ -146,3 +146,93 @@ func TestBuildFailureRemovesPartialIndex(t *testing.T) {
 		t.Fatalf("temporary files remain: %v (%v)", temps, err)
 	}
 }
+
+func TestUpdateRescansGrowingTailAndAppendedFiles(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.jsonl")
+	newPath := filepath.Join(dir, "new.jsonl")
+	t1 := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Minute)
+	oldFiles := []ports.LogFile{
+		{Name: "binlog.000001", Size: 100, ModifiedAt: t1},
+		{Name: "binlog.000002", Size: 100, ModifiedAt: t1},
+	}
+	txn := func(gtid string, commit time.Time) *core.Transaction {
+		return &core.Transaction{
+			Ref:  core.TransactionRef{Backend: "mysql", InstanceID: "instance", NativeTransactionID: gtid},
+			GTID: gtid, CommitTime: commit, Executable: true,
+		}
+	}
+	initial := fakeSource{transactions: map[string][]*core.Transaction{
+		"binlog.000001": {txn("uuid:1", t1)},
+		"binlog.000002": {txn("uuid:2", t1)},
+	}}
+	if _, err := Build(context.Background(), initial, fakeCatalog{files: oldFiles}, BuildOptions{
+		OutputPath: oldPath, Backend: "mysql", InstanceID: "instance",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldRaw, _ := os.ReadFile(oldPath)
+	currentFiles := []ports.LogFile{
+		oldFiles[0],
+		{Name: "binlog.000002", Size: 150, ModifiedAt: t2},
+		{Name: "binlog.000003", Size: 80, ModifiedAt: t2},
+	}
+	updatedSource := fakeSource{transactions: map[string][]*core.Transaction{
+		"binlog.000002": {txn("uuid:2", t1), txn("uuid:3", t2)},
+		"binlog.000003": {txn("uuid:4", t2)},
+	}}
+	result, err := Update(context.Background(), updatedSource, fakeCatalog{files: currentFiles}, UpdateOptions{
+		ExistingPath: oldPath, OutputPath: newPath, Backend: "mysql", InstanceID: "instance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Current || result.CopiedTransactions != 1 || result.ScannedTransactions != 3 || result.FilesAdded != 1 || result.FilesRescanned != 2 {
+		t.Fatalf("unexpected update result: %+v", result)
+	}
+	afterOld, _ := os.ReadFile(oldPath)
+	if string(afterOld) != string(oldRaw) {
+		t.Fatal("update modified the existing index")
+	}
+	var got []string
+	header, count, err := Query(context.Background(), newPath, Filter{}, func(entry Entry) error {
+		got = append(got, entry.Ref.NativeTransactionID)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 || strings.Join(got, ",") != "uuid:1,uuid:2,uuid:3,uuid:4" || len(header.Files) != 3 {
+		t.Fatalf("unexpected updated index: count=%d got=%v files=%+v", count, got, header.Files)
+	}
+	unusedOutput := filepath.Join(dir, "unused.jsonl")
+	current, err := Update(context.Background(), updatedSource, fakeCatalog{files: currentFiles}, UpdateOptions{
+		ExistingPath: newPath, OutputPath: unusedOutput, Backend: "mysql", InstanceID: "instance",
+	})
+	if err != nil || !current.Current {
+		t.Fatalf("unchanged update = %+v, %v", current, err)
+	}
+	if _, err := os.Stat(unusedOutput); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("current update unexpectedly wrote output: %v", err)
+	}
+}
+
+func TestSafeAppendPlanRejectsDestructiveArchiveChanges(t *testing.T) {
+	t1 := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	indexed := []ports.LogFile{
+		{Name: "binlog.000001", Size: 100, ModifiedAt: t1},
+		{Name: "binlog.000002", Size: 100, ModifiedAt: t1},
+	}
+	tests := []FileChanges{
+		{Removed: []ports.LogFile{indexed[0]}},
+		{Changed: []ports.LogFile{{Name: "binlog.000001", Size: 120, ModifiedAt: t1.Add(time.Minute)}}},
+		{Changed: []ports.LogFile{{Name: "binlog.000002", Size: 90, ModifiedAt: t1.Add(time.Minute)}}},
+		{Added: []ports.LogFile{{Name: "binlog.000000", Size: 50, ModifiedAt: t1}}},
+	}
+	for _, changes := range tests {
+		if _, err := safeAppendPlan(indexed, changes); err == nil || !strings.Contains(err.Error(), "full index build") {
+			t.Fatalf("expected full rebuild rejection for %+v, got %v", changes, err)
+		}
+	}
+}
